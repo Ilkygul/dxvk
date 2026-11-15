@@ -1,0 +1,1264 @@
+#include "dxvk_image.h"
+
+#include "dxvk_device.h"
+
+#ifndef _WIN32
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <sstream>
+#include <unistd.h>
+#endif
+
+namespace dxvk {
+  
+  DxvkKeyedMutex::DxvkKeyedMutex(
+      const Rc<DxvkDevice>& device,
+            uint64_t        initialValue,
+            bool            ntShared)
+  : m_vkd(device->vkd()) {
+    DxvkFenceCreateInfo fenceInfo;
+    fenceInfo.initialValue = 0;
+    fenceInfo.sharedType = ntShared
+      ? VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT
+      : VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+    m_fence = device->createFence(fenceInfo);
+    if (!m_fence)
+      throw DxvkError("DxvkKeyedMutex: Failed to create fence");
+
+    D3DKMT_CREATEKEYEDMUTEX2 create = { };
+    create.Flags.NtSecuritySharing = ntShared;
+    create.InitialValue = initialValue;
+    if (D3DKMTCreateKeyedMutex2(&create))
+      throw DxvkError("DxvkKeyedMutex: Failed to create mutex");
+
+    m_kmtLocal = create.hKeyedMutex;
+    m_kmtGlobal = create.hSharedHandle;
+  }
+
+
+  DxvkKeyedMutex::DxvkKeyedMutex(
+      const Rc<DxvkDevice>& device,
+            Rc<DxvkFence>&& fence,
+            D3DKMT_HANDLE   kmtLocal,
+            D3DKMT_HANDLE   kmtGlobal)
+  : m_vkd(device->vkd()),
+    m_fence(fence),
+    m_kmtLocal(kmtLocal),
+    m_kmtGlobal(kmtGlobal) {
+    if (!fence)
+      Logger::err("DxvkKeyedMutex::DxvkKeyedMutex: No fence provided");
+  }
+
+    
+  DxvkKeyedMutex::~DxvkKeyedMutex() {
+    if (m_kmtLocal) {
+      D3DKMT_DESTROYKEYEDMUTEX destroy = { };
+      destroy.hKeyedMutex = m_kmtLocal;
+      D3DKMTDestroyKeyedMutex(&destroy);
+    }
+  }
+
+
+  HRESULT DxvkKeyedMutex::AcquireSync(UINT64 key, DWORD  milliseconds) {
+    if (m_owned.load(std::memory_order_acquire))
+      return DXGI_ERROR_INVALID_CALL;
+
+    LARGE_INTEGER timeout = { };
+    D3DKMT_ACQUIREKEYEDMUTEX acquire = { };
+    acquire.hKeyedMutex = m_kmtLocal;
+    acquire.Key = key;
+    acquire.pTimeout = &timeout;
+    timeout.QuadPart = milliseconds * -10000;
+
+    NTSTATUS status = D3DKMTAcquireKeyedMutex(&acquire);
+    if (status == STATUS_TIMEOUT)
+      return WAIT_TIMEOUT;
+    if (status)
+      return DXGI_ERROR_INVALID_CALL;
+
+    VkSemaphore semaphore = m_fence->handle();
+    VkSemaphoreWaitInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+    info.semaphoreCount = 1;
+    info.pSemaphores = &semaphore;
+    info.pValues = &acquire.FenceValue;
+
+    if (m_vkd->vkWaitSemaphores(m_vkd->device(), &info, -1)) {
+      Logger::warn("DxvkKeyedMutex::AcquireSync: Failed to wait semaphore");
+      return DXGI_ERROR_INVALID_CALL;
+    }
+
+    m_fenceValue = acquire.FenceValue;
+    m_owned.store(true, std::memory_order_release);
+    return S_OK;
+  }
+
+
+  HRESULT DxvkKeyedMutex::ReleaseSync(UINT64 key) {
+    if (!m_owned.load(std::memory_order_acquire))
+      return DXGI_ERROR_INVALID_CALL;
+
+    VkSemaphoreSignalInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
+    info.semaphore = m_fence->handle();
+    info.value = m_fenceValue + 1;
+
+    if (m_vkd->vkSignalSemaphore(m_vkd->device(), &info)) {
+      Logger::warn("D3D11DXGIKeyedMutex::ReleaseSync: Failed to signal semaphore");
+      return DXGI_ERROR_INVALID_CALL;
+    }
+
+    D3DKMT_RELEASEKEYEDMUTEX release = { };
+    release.hKeyedMutex = m_kmtLocal;
+    release.Key = key;
+    release.FenceValue = m_fenceValue + 1;
+
+    if (D3DKMTReleaseKeyedMutex(&release)) {
+      Logger::warn("D3D11DXGIKeyedMutex::ReleaseSync: Failed to release mutex.");
+      return DXGI_ERROR_INVALID_CALL;
+    }
+
+    m_owned.store(false, std::memory_order_release);
+    return S_OK;
+  }
+
+
+  DxvkImage::DxvkImage(
+          DxvkDevice*           device,
+    const DxvkImageCreateInfo&  createInfo,
+          DxvkMemoryAllocator&  allocator,
+          VkMemoryPropertyFlags memFlags)
+  : DxvkPagedResource(allocator),
+    m_vkd           (device->vkd()),
+    m_properties    (memFlags),
+    m_shaderStages  (util::shaderStages(createInfo.stages)),
+    m_info          (createInfo) {
+    m_allocator->registerResource(this);
+
+    copyFormatList(createInfo.viewFormatCount, createInfo.viewFormats);
+    m_unifiedLayoutAvailable = device->features().khrUnifiedImageLayouts.unifiedImageLayouts;
+
+    // Assign debug name to image
+    if (device->debugFlags().test(DxvkDebugFlag::Capture)) {
+      m_debugName = createDebugName(createInfo.debugName);
+      m_info.debugName = m_debugName.c_str();
+    } else {
+      m_info.debugName = nullptr;
+    }
+
+    // Always enable depth-stencil attachment usage for depth-stencil
+    // formats since some internal operations rely on it. Read-only
+    // versions of these make little sense to begin with.
+    if (lookupFormatInfo(createInfo.format)->aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+      m_info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+
+    // Check whether the unified layout path can be used once
+    // we know all image properties
+    m_unifiedLayoutEnabled = canUseUnifiedLayout(*device);
+
+    if (m_unifiedLayoutEnabled)
+      m_info.layout = VK_IMAGE_LAYOUT_GENERAL;
+
+    // Dmabuf sharing uses DRM format modifier tiling when the device
+    // supports it, and falls back to linear otherwise. Must be known
+    // before getImageCreateInfo determines the image tiling.
+    // (dmabufForceLinear does NOT disable this: drivers commonly reject
+    // dma-buf external memory on plain LINEAR tiling, so a linear
+    // export must be expressed as DRM_FORMAT_MOD_LINEAR through the
+    // modifier path — see canShareDmabufImage.)
+    // DXVK_DMABUF_NO_MODIFIERS=1 forces the linear fallback (debugging).
+    const char* noModifiers = std::getenv("DXVK_DMABUF_NO_MODIFIERS");
+
+    m_dmabufUseModifiers = isDmabufShared()
+      && device->features().extImageDrmFormatModifier
+      && !(noModifiers && noModifiers[0] == '1');
+
+    // Determine whether the image is shareable before creating the resource
+    VkImageCreateInfo imageInfo = getImageCreateInfo(DxvkImageUsageInfo());
+    m_shared = canShareImage(device, imageInfo, m_info.sharing);
+
+    // Exported dmabuf images only have to be usable as D3D11 shared
+    // surfaces (render target, shader resource, copy source/destination).
+    // If the driver rejects the full usage, e.g. STORAGE on a linear or
+    // modifier-tiled image, drop what the surface does not need and ask
+    // again. Imports are left alone, they must match the exporter.
+    if (!m_shared && isDmabufShared() && m_info.sharing.mode == DxvkSharedHandleMode::Export) {
+      constexpr VkImageUsageFlags UnsharableUsage =
+          VK_IMAGE_USAGE_STORAGE_BIT
+        | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT
+        | VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+
+      if (m_info.usage & UnsharableUsage) {
+        VkImageUsageFlags oldUsage = m_info.usage;
+        m_info.usage &= ~UnsharableUsage;
+
+        Logger::warn(str::format("DxvkImage: dmabuf export rejected, retrying without usage bits 0x",
+          std::hex, (oldUsage & UnsharableUsage), " (usage 0x", oldUsage, " -> 0x", m_info.usage, std::dec, ")"));
+
+        imageInfo = getImageCreateInfo(DxvkImageUsageInfo());
+        m_shared = canShareImage(device, imageInfo, m_info.sharing);
+      }
+
+      // Last resort: drop creation flags that restrict external images
+      // (cube/array/block-texel compatibility, extended usage, ...)
+      constexpr VkImageCreateFlags KeepFlags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
+      if (!m_shared && (m_info.flags & ~KeepFlags)) {
+        VkImageCreateFlags oldFlags = m_info.flags;
+        m_info.flags &= KeepFlags;
+
+        Logger::warn(str::format("DxvkImage: dmabuf export rejected, retrying with flags 0x",
+          std::hex, oldFlags, " -> 0x", m_info.flags, std::dec));
+
+        imageInfo = getImageCreateInfo(DxvkImageUsageInfo());
+        m_shared = canShareImage(device, imageInfo, m_info.sharing);
+      }
+    }
+
+    // Consumers of dmabuf sharing depend on the handle being real;
+    // never fall back to a silently non-shared image.
+    if (!m_shared && isDmabufShared()) {
+      m_allocator->unregisterResource(this);
+      throw DxvkError("DxvkImage: Cannot create dmabuf-shared image");
+    }
+
+    m_globalLayout = (m_info.sharing.mode != DxvkSharedHandleMode::Import)
+      ? m_info.initialLayout : m_info.layout;
+
+    try {
+      assignStorage(allocateStorage());
+    } catch (...) {
+      m_allocator->unregisterResource(this);
+      throw;
+    }
+  }
+
+
+  DxvkImage::DxvkImage(
+          DxvkDevice*           device,
+    const DxvkImageCreateInfo&  createInfo,
+          VkImage               imageHandle,
+          DxvkMemoryAllocator&  allocator,
+          VkMemoryPropertyFlags memFlags)
+  : DxvkPagedResource(allocator),
+    m_vkd           (device->vkd()),
+    m_properties    (memFlags),
+    m_shaderStages  (util::shaderStages(createInfo.stages)),
+    m_info          (createInfo),
+    m_stableAddress (true),
+    m_globalLayout  (createInfo.initialLayout) {
+    m_allocator->registerResource(this);
+
+    copyFormatList(createInfo.viewFormatCount, createInfo.viewFormats);
+
+    // Create backing storage for existing image resource
+    DxvkAllocationInfo allocationInfo = { };
+    allocationInfo.resourceCookie = cookie();
+
+    VkImageCreateInfo imageInfo = getImageCreateInfo(DxvkImageUsageInfo());
+    assignStorage(m_allocator->importImageResource(imageInfo, allocationInfo, imageHandle));
+  }
+
+
+  DxvkImage::~DxvkImage() {
+    m_allocator->unregisterResource(this);
+  }
+
+
+  bool DxvkImage::canRelocate() const {
+    return !m_imageInfo.mapPtr && !m_shared && !m_stableAddress
+        && !(m_info.flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT);
+  }
+
+
+  HANDLE DxvkImage::sharedHandle() const {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+
+    if (!m_shared)
+      return INVALID_HANDLE_VALUE;
+
+#ifdef _WIN32
+    DxvkResourceMemoryInfo memoryInfo = m_storage->getMemoryInfo();
+
+    VkMemoryGetWin32HandleInfoKHR handleInfo = { VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR };
+    handleInfo.handleType = m_info.sharing.type;
+    handleInfo.memory = memoryInfo.memory;
+
+    if (m_vkd->vkGetMemoryWin32HandleKHR(m_vkd->device(), &handleInfo, &handle) != VK_SUCCESS)
+      Logger::warn("DxvkImage::DxvkImage: Failed to get shared handle for image");
+#endif
+
+    return handle;
+  }
+
+
+  DxvkSparsePageTable* DxvkImage::getSparsePageTable() {
+    return m_storage->getSparsePageTable();
+  }
+
+
+  Rc<DxvkResourceAllocation> DxvkImage::relocateStorage(
+          DxvkAllocationModes         mode) {
+    if (!canRelocate())
+      return nullptr;
+
+    return allocateStorageWithUsage(DxvkImageUsageInfo(), mode);
+  }
+
+
+  uint64_t DxvkImage::getSubresourceAddressAt(uint32_t mip, uint32_t layer, VkOffset3D coord) const {
+    // For 2D and 3D images, use morton codes to linearize the address ranges
+    // of pixel blocks. This helps reduce false positives in common use cases
+    // where the application copies aligned power-of-two blocks around.
+    uint64_t base = getSubresourceStartAddress(mip, layer);
+
+    if (likely(m_info.type == VK_IMAGE_TYPE_2D))
+      return base + bit::interleave(coord.x, coord.y);
+
+    // For 1D we can simply use the pixel coordinate as-is
+    if (m_info.type == VK_IMAGE_TYPE_1D)
+      return base + coord.x;
+
+    // 3D is uncommon, but there are different use cases. Assume that if the
+    // format is block-compressed, the app will access one layer at a time.
+    if (formatInfo()->flags.test(DxvkFormatFlag::BlockCompressed))
+      return base + bit::interleave(coord.x, coord.y) + (uint64_t(coord.z) << 32u);
+
+    // Otherwise, it may want to copy actual 3D blocks around.
+    return base + bit::interleave(coord.x, coord.y, coord.z);
+  }
+
+
+  Rc<DxvkImageView> DxvkImage::createView(
+    const DxvkImageViewKey& info) {
+    std::unique_lock lock(m_viewMutex);
+
+    auto entry = m_views.emplace(std::piecewise_construct,
+      std::make_tuple(info), std::make_tuple(this, info));
+
+    return &entry.first->second;
+  }
+
+
+  Rc<DxvkResourceAllocation> DxvkImage::allocateStorage() {
+    return allocateStorageWithUsage(DxvkImageUsageInfo(), 0u);
+  }
+
+
+  Rc<DxvkResourceAllocation> DxvkImage::allocateStorageWithUsage(
+    const DxvkImageUsageInfo&         usageInfo,
+          DxvkAllocationModes         mode) {
+    const DxvkFormatInfo* formatInfo = lookupFormatInfo(m_info.format);
+    small_vector<VkFormat, 4> localViewFormats;
+
+    VkImageCreateInfo imageInfo = getImageCreateInfo(usageInfo);
+
+    // Set up view format list so that drivers can better enable
+    // compression. Skip for planar formats due to validation errors.
+    VkImageFormatListCreateInfo formatList = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
+
+    if (!(formatInfo->aspectMask & VK_IMAGE_ASPECT_PLANE_0_BIT)) {
+      if (usageInfo.viewFormatCount) {
+        for (uint32_t i = 0; i < m_viewFormats.size(); i++)
+          localViewFormats.push_back(m_viewFormats[i]);
+
+        for (uint32_t i = 0; i < usageInfo.viewFormatCount; i++) {
+          if (!isViewCompatible(usageInfo.viewFormats[i]))
+            localViewFormats.push_back(usageInfo.viewFormats[i]);
+        }
+
+        formatList.viewFormatCount = localViewFormats.size();
+        formatList.pViewFormats = localViewFormats.data();
+      } else {
+        formatList.viewFormatCount = m_viewFormats.size();
+        formatList.pViewFormats = m_viewFormats.data();
+      }
+    }
+
+    if ((m_info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && formatList.viewFormatCount)
+      formatList.pNext = std::exchange(imageInfo.pNext, &formatList);
+
+    // Set up external memory parameters for shared images
+    VkExternalMemoryImageCreateInfo externalInfo = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+
+    if (m_shared) {
+      externalInfo.pNext = std::exchange(imageInfo.pNext, &externalInfo);
+      externalInfo.handleTypes = m_info.sharing.type;
+    }
+
+    // Set up DRM format modifier parameters for dmabuf-shared images:
+    // exports let the driver pick from the supported modifiers,
+    // imports recreate the image with the exporter's exact layout.
+    VkImageDrmFormatModifierListCreateInfoEXT modifierList = { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT };
+    VkImageDrmFormatModifierExplicitCreateInfoEXT modifierExplicit = { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT };
+
+    std::vector<uint64_t> modifierValues;
+
+    if (m_shared && isDmabufShared() && m_dmabufUseModifiers) {
+      if (m_info.sharing.mode == DxvkSharedHandleMode::Export) {
+        modifierValues.reserve(m_dmabufModifiers.size());
+
+        for (const auto& m : m_dmabufModifiers)
+          modifierValues.push_back(m.first);
+
+        modifierList.drmFormatModifierCount = modifierValues.size();
+        modifierList.pDrmFormatModifiers = modifierValues.data();
+        modifierList.pNext = std::exchange(imageInfo.pNext, &modifierList);
+      } else {
+        modifierExplicit.drmFormatModifier = m_info.sharing.dmabufModifier;
+        modifierExplicit.drmFormatModifierPlaneCount = m_info.sharing.dmabufPlaneCount;
+        modifierExplicit.pPlaneLayouts = m_info.sharing.dmabufPlanes.data();
+        modifierExplicit.pNext = std::exchange(imageInfo.pNext, &modifierExplicit);
+      }
+    }
+
+    // Set up shared memory properties
+    void* sharedMemoryInfo = nullptr;
+
+    VkExportMemoryAllocateInfo sharedExport = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
+    VkImportMemoryWin32HandleInfoKHR sharedImportWin32 = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+    VkImportMemoryFdInfoKHR sharedImportFd = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
+    sharedImportFd.fd = -1;
+
+    DxvkAllocationInfo allocationInfo = { };
+    allocationInfo.resourceCookie = cookie();
+    allocationInfo.properties = m_properties;
+    allocationInfo.mode = mode;
+    allocationInfo.handleType = m_info.sharing.type;
+
+    if (m_shared && m_info.sharing.mode == DxvkSharedHandleMode::Export) {
+      sharedExport.pNext = std::exchange(sharedMemoryInfo, &sharedExport);
+      sharedExport.handleTypes = m_info.sharing.type;
+    }
+
+    if (m_shared && m_info.sharing.mode == DxvkSharedHandleMode::Import) {
+      if (!isDmabufShared()) {
+        sharedImportWin32.pNext = std::exchange(sharedMemoryInfo, &sharedImportWin32);
+        sharedImportWin32.handleType = m_info.sharing.type;
+        sharedImportWin32.handle = m_info.sharing.handle;
+      }
+#ifndef _WIN32
+      else {
+        // The dmabuf constrains the memory types the import can use
+        VkMemoryFdPropertiesKHR fdProperties = { VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR };
+
+        VkResult vr = m_vkd->vkGetMemoryFdPropertiesKHR(m_vkd->device(),
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+          m_info.sharing.fd, &fdProperties);
+
+        if (vr != VK_SUCCESS)
+          throw DxvkError(str::format("DxvkImage: Failed to query dmabuf fd properties: ", vr));
+
+        allocationInfo.memoryTypeBits = fdProperties.memoryTypeBits;
+
+        // Vulkan consumes the fd on a successful import; the caller
+        // keeps ownership of theirs, so import a dup.
+        sharedImportFd.fd = dup(m_info.sharing.fd);
+
+        if (sharedImportFd.fd < 0)
+          throw DxvkError("DxvkImage: Failed to dup dmabuf fd");
+
+        sharedImportFd.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        sharedImportFd.pNext = std::exchange(sharedMemoryInfo, &sharedImportFd);
+      }
+#endif
+    }
+
+    if (m_info.transient)
+      allocationInfo.mode.set(DxvkAllocationMode::NoDedicated);
+
+    Rc<DxvkResourceAllocation> allocation;
+
+    try {
+      allocation = m_allocator->createImageResource(imageInfo,
+        allocationInfo, sharedMemoryInfo);
+    } catch (...) {
+#ifndef _WIN32
+      // A failed vkAllocateMemory leaves imported fd ownership with us
+      if (sharedImportFd.fd >= 0)
+        close(sharedImportFd.fd);
+#endif
+      throw;
+    }
+
+    // Reject imports whose backing memory does not cover the image
+    if (m_shared && isDmabufShared()
+     && m_info.sharing.mode == DxvkSharedHandleMode::Import
+     && m_info.sharing.dmabufAllocationSize
+     && allocation->getMemoryInfo().size > m_info.sharing.dmabufAllocationSize)
+      throw DxvkError(str::format("DxvkImage: dmabuf too small for image: ",
+        m_info.sharing.dmabufAllocationSize, " < ", allocation->getMemoryInfo().size));
+
+    return allocation;
+  }
+
+
+  Rc<DxvkResourceAllocation> DxvkImage::assignStorage(
+          Rc<DxvkResourceAllocation>&& resource) {
+    return assignStorageWithUsage(std::move(resource), DxvkImageUsageInfo());
+  }
+
+
+  Rc<DxvkResourceAllocation> DxvkImage::assignStorageWithUsage(
+          Rc<DxvkResourceAllocation>&& resource,
+    const DxvkImageUsageInfo&         usageInfo) {
+    Rc<DxvkResourceAllocation> old = std::move(m_storage);
+
+    // Self-assignment is possible here if we
+    // just update the image properties
+    bool invalidateViews = false;
+    m_storage = std::move(resource);
+
+    if (m_storage != old) {
+      m_imageInfo = m_storage->getImageInfo();
+
+      if (unlikely(m_info.debugName))
+        updateDebugName();
+
+      invalidateViews = true;
+    }
+
+    if ((m_info.access | usageInfo.access) != m_info.access)
+      invalidateViews = true;
+
+    m_info.flags |= usageInfo.flags;
+    m_info.usage |= usageInfo.usage;
+    m_info.stages |= usageInfo.stages;
+    m_info.access |= usageInfo.access;
+
+    if (usageInfo.colorSpace != VK_COLOR_SPACE_MAX_ENUM_KHR)
+      m_info.colorSpace = usageInfo.colorSpace;
+
+    for (uint32_t i = 0; i < usageInfo.viewFormatCount; i++) {
+      if (!isViewCompatible(usageInfo.viewFormats[i]))
+        m_viewFormats.push_back(usageInfo.viewFormats[i]);
+    }
+
+    if (!m_viewFormats.empty()) {
+      m_info.viewFormatCount = m_viewFormats.size();
+      m_info.viewFormats = m_viewFormats.data();
+    }
+
+    // If feedback loops are enabled and the unified layout extension is
+    // not natively supported, we need to disable the unified layout path
+    if (m_info.usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)
+      m_unifiedLayoutEnabled = m_unifiedLayoutEnabled && m_unifiedLayoutAvailable;
+
+    if (usageInfo.layout != VK_IMAGE_LAYOUT_UNDEFINED && !m_unifiedLayoutEnabled) {
+      m_info.layout = usageInfo.layout;
+      invalidateViews = true;
+    }
+
+    m_stableAddress |= usageInfo.stableGpuAddress;
+
+    if (invalidateViews)
+      m_version += 1u;
+
+    if (!(m_properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+      auto common = m_properties & m_storage->getMemoryProperties();
+
+      updateResidencyStatus((common & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        ? DxvkResourceResidency::Resident
+        : DxvkResourceResidency::Evicted);
+    }
+
+    return old;
+  }
+
+
+  bool DxvkImage::isInitialized(const VkImageSubresource& subresource) const {
+    VkImageLayout layout = queryLayout(subresource);
+
+    return layout != VK_IMAGE_LAYOUT_UNDEFINED
+        && layout != VK_IMAGE_LAYOUT_PREINITIALIZED;
+  }
+
+
+  bool DxvkImage::isInitialized(const VkImageSubresourceRange& subresources) const {
+    if (m_globalLayout != VK_IMAGE_LAYOUT_MAX_ENUM) {
+      return m_globalLayout != VK_IMAGE_LAYOUT_UNDEFINED
+          && m_globalLayout != VK_IMAGE_LAYOUT_PREINITIALIZED;
+    } else {
+      // Check each individual subresource layout
+      VkImageAspectFlags aspects = subresources.aspectMask;
+
+      while (aspects) {
+        VkImageSubresource subresource = { };
+        subresource.aspectMask = vk::getNextAspect(aspects);
+        subresource.mipLevel = subresources.baseMipLevel;
+        subresource.arrayLayer = subresources.baseArrayLayer;
+
+        for (uint32_t m = 0u; m < subresources.levelCount; m++) {
+          uint32_t index = computeSubresourceIndex(subresource);
+
+          for (uint32_t l = 0u; l < subresources.layerCount; l++) {
+            VkImageLayout layout = m_localLayouts[index + l];
+
+            if (layout == VK_IMAGE_LAYOUT_UNDEFINED
+             || layout == VK_IMAGE_LAYOUT_PREINITIALIZED)
+              return false;
+          }
+
+          subresource.mipLevel += 1u;
+        }
+      }
+
+      return true;
+    }
+  }
+
+
+  VkImageLayout DxvkImage::queryLayout(const VkImageSubresourceRange& subresources) const {
+    // Check whether the entire resource is in the same layout
+    if (m_globalLayout != VK_IMAGE_LAYOUT_MAX_ENUM)
+      return m_globalLayout;
+
+    VkImageSubresource subresource = { };
+    subresource.aspectMask = subresources.aspectMask & (subresources.aspectMask - 1u);
+    subresource.mipLevel = subresources.baseMipLevel;
+    subresource.arrayLayer = subresources.baseArrayLayer;
+
+    VkImageLayout baseLayout = queryLayout(subresource);
+
+    // If only one subresource is included in the range, return its layout
+    VkImageAspectFlags nonplanarAspects = VK_IMAGE_ASPECT_COLOR_BIT
+                                        | VK_IMAGE_ASPECT_DEPTH_BIT
+                                        | VK_IMAGE_ASPECT_STENCIL_BIT;
+
+    if (subresources.levelCount == 1u
+     && subresources.layerCount == 1u
+     && (subresources.aspectMask & nonplanarAspects))
+      return baseLayout;
+
+    // Otherwise, check whether all subresources have the same layout
+    VkImageAspectFlags aspects = subresources.aspectMask;
+
+    while (aspects) {
+      subresource.aspectMask = vk::getNextAspect(aspects);
+      subresource.mipLevel = subresources.baseMipLevel;
+
+      for (uint32_t m = 0u; m < subresources.levelCount; m++) {
+        uint32_t index = computeSubresourceIndex(subresource);
+
+        for (uint32_t l = 0u; l < subresources.layerCount; l++) {
+          if (m_localLayouts[index + l] != baseLayout)
+            return VK_IMAGE_LAYOUT_MAX_ENUM;
+        }
+
+        subresource.mipLevel += 1u;
+      }
+    }
+
+    return baseLayout;
+  }
+
+
+  void DxvkImage::trackLayout(const VkImageSubresourceRange& subresources, VkImageLayout layout) {
+    // Nothing to do if the layout doesn't change
+    if (m_globalLayout == layout)
+      return;
+
+    if (subresources == getAvailableSubresources()) {
+      // Entire resource is in the same layout
+      m_globalLayout = layout;
+    } else {
+      if (m_globalLayout != VK_IMAGE_LAYOUT_MAX_ENUM) {
+        // If previously the entire resource was in the same layout,
+        // we need to update all subresource entries to that layout
+        if (m_localLayouts.empty())
+          m_localLayouts.resize(computeSubresourceCount());
+
+        for (size_t i = 0u; i < m_localLayouts.size(); i++)
+          m_localLayouts[i] = m_globalLayout;
+
+        m_globalLayout = VK_IMAGE_LAYOUT_MAX_ENUM;
+      }
+
+      // Update entries contained in the subresource range
+      VkImageAspectFlags aspects = subresources.aspectMask;
+
+      while (aspects) {
+        VkImageSubresource subresource;
+        subresource.aspectMask = vk::getNextAspect(aspects);
+        subresource.mipLevel = subresources.baseMipLevel;
+        subresource.arrayLayer = subresources.baseArrayLayer;
+
+        for (uint32_t m = 0u; m < subresources.levelCount; m++) {
+          uint32_t index = computeSubresourceIndex(subresource);
+
+          for (uint32_t l = 0u; l < subresources.layerCount; l++)
+            m_localLayouts[index + l] = layout;
+
+          subresource.mipLevel += 1u;
+        }
+      }
+    }
+  }
+
+
+  void DxvkImage::setDebugName(const char* name) {
+    if (likely(!m_info.debugName))
+      return;
+
+    m_debugName = createDebugName(name);
+    m_info.debugName = m_debugName.c_str();
+
+    updateDebugName();
+  }
+
+
+  void DxvkImage::updateDebugName() {
+    if (m_storage->flags().test(DxvkAllocationFlag::OwnsImage)) {
+      VkDebugUtilsObjectNameInfoEXT nameInfo = { VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+      nameInfo.objectType = VK_OBJECT_TYPE_IMAGE;
+      nameInfo.objectHandle = vk::getObjectHandle(m_imageInfo.image);
+      nameInfo.pObjectName = m_info.debugName;
+
+      m_vkd->vkSetDebugUtilsObjectNameEXT(m_vkd->device(), &nameInfo);
+    }
+  }
+
+
+  std::string DxvkImage::createDebugName(const char* name) const {
+    return str::format(vk::isValidDebugName(name) ? name : "Image", " (", cookie(), ")");
+  }
+
+
+  VkImageCreateInfo DxvkImage::getImageCreateInfo(
+    const DxvkImageUsageInfo&         usageInfo) const {
+    VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    info.flags = m_info.flags | usageInfo.flags;
+    info.imageType = m_info.type;
+    info.format = m_info.format;
+    info.extent = m_info.extent;
+    info.mipLevels = m_info.mipLevels;
+    info.arrayLayers = m_info.numLayers;
+    info.samples = m_info.sampleCount;
+    info.tiling = m_info.tiling;
+    info.usage = m_info.usage | usageInfo.usage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = m_info.initialLayout;
+
+    // Dmabuf-shared images are tiled by an explicit DRM format
+    // modifier so the layout is transportable across devices, or
+    // linearly when the modifier extension is unavailable.
+    if (isDmabufShared()) {
+      info.tiling = m_dmabufUseModifiers
+        ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+        : VK_IMAGE_TILING_LINEAR;
+      info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+
+    return info;
+  }
+
+
+  void DxvkImage::copyFormatList(uint32_t formatCount, const VkFormat* formats) {
+    m_viewFormats.resize(formatCount);
+
+    for (uint32_t i = 0; i < formatCount; i++)
+      m_viewFormats[i] = formats[i];
+
+    m_info.viewFormats = m_viewFormats.data();
+  }
+
+
+  bool DxvkImage::canShareImage(DxvkDevice* device, const VkImageCreateInfo& createInfo, const DxvkSharedHandleInfo& sharingInfo) {
+    if (sharingInfo.mode == DxvkSharedHandleMode::None)
+      return false;
+
+    if (createInfo.flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
+      Logger::err("Failed to create shared resource: Sharing sparse resources not supported");
+      return false;
+    }
+
+    if (sharingInfo.type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+      return canShareDmabufImage(device, createInfo, sharingInfo);
+
+    if (!device->features().khrExternalMemoryWin32) {
+      Logger::err("Failed to create shared resource: VK_KHR_EXTERNAL_MEMORY_WIN32 not supported");
+      return false;
+    }
+
+    DxvkFormatQuery formatQuery = { };
+    formatQuery.format = createInfo.format;
+    formatQuery.type = createInfo.imageType;
+    formatQuery.tiling = createInfo.tiling;
+    formatQuery.usage = createInfo.usage;
+    formatQuery.flags = createInfo.flags;
+    formatQuery.handleType = sharingInfo.type;
+
+    auto limits = device->getFormatLimits(formatQuery);
+
+    if (!limits)
+      return false;
+
+    VkExternalMemoryFeatureFlagBits requiredFeature = sharingInfo.mode == DxvkSharedHandleMode::Export
+      ? VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT
+      : VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+
+    if (!(limits->externalFeatures & requiredFeature)) {
+      Logger::err("Failed to create shared resource: Image cannot be shared");
+      return false;
+    }
+
+    return true;
+  }
+
+
+  bool DxvkImage::canShareDmabufImage(DxvkDevice* device, const VkImageCreateInfo& createInfo, const DxvkSharedHandleInfo& sharingInfo) {
+    if (!device->features().khrExternalMemoryFd
+     || !device->features().extExternalMemoryDmaBuf) {
+      Logger::err("Failed to create dmabuf-shared resource: external memory fd not supported");
+      return false;
+    }
+
+    m_dmabufModifiers.clear();
+
+    // Exports must also be importable on a peer device
+    VkExternalMemoryFeatureFlags requiredFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+
+    if (sharingInfo.mode == DxvkSharedHandleMode::Export)
+      requiredFeatures |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+
+    if (!m_dmabufUseModifiers) {
+      // Linear fallback: without modifiers only a linear layout is
+      // transportable, and only linear imports can be accepted.
+      if (sharingInfo.mode == DxvkSharedHandleMode::Import
+       && (sharingInfo.dmabufModifier != 0u || sharingInfo.dmabufPlaneCount != 1u)) {
+        Logger::err("Failed to import dmabuf-shared resource: modifiers not supported");
+        return false;
+      }
+
+      DxvkFormatQuery formatQuery = { };
+      formatQuery.format = createInfo.format;
+      formatQuery.type = createInfo.imageType;
+      formatQuery.tiling = VK_IMAGE_TILING_LINEAR;
+      formatQuery.usage = createInfo.usage;
+      formatQuery.flags = createInfo.flags;
+      formatQuery.handleType = sharingInfo.type;
+
+      auto limits = device->getFormatLimits(formatQuery);
+
+      if (!limits
+       || (limits->externalFeatures & requiredFeatures) != requiredFeatures
+       || createInfo.mipLevels > limits->maxMipLevels
+       || createInfo.arrayLayers > limits->maxArrayLayers) {
+        Logger::err(str::format("Failed to create dmabuf-shared resource: linear image not shareable",
+          "\n  format:           ", createInfo.format,
+          "\n  usage:            0x", std::hex, createInfo.usage,
+          "\n  flags:            0x", createInfo.flags, std::dec,
+          "\n  mips/layers:      ", createInfo.mipLevels, " / ", createInfo.arrayLayers,
+          "\n  samples:          ", uint32_t(createInfo.samples),
+          "\n  query result:     ", limits ? "ok" : "VK_ERROR_FORMAT_NOT_SUPPORTED (or other failure)",
+          "\n  externalFeatures: 0x", std::hex, limits ? limits->externalFeatures : 0u,
+          " (required 0x", requiredFeatures, ")", std::dec,
+          limits ? str::format("\n  max mips/layers:  ", limits->maxMipLevels, " / ", limits->maxArrayLayers) : std::string(),
+          "\n  VK_EXT_image_drm_format_modifier: ",
+          device->features().extImageDrmFormatModifier ? "enabled" : "NOT enabled on the device"));
+        return false;
+      }
+
+      m_dmabufModifiers.push_back({ 0u /* DRM_FORMAT_MOD_LINEAR */, 1u });
+      return true;
+    }
+
+    // Enumerate the modifiers the driver supports for the format
+    auto vki = device->adapter()->vki();
+
+    VkDrmFormatModifierPropertiesListEXT modifierList = { VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT };
+    VkFormatProperties2 formatProperties = { VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &modifierList };
+
+    vki->vkGetPhysicalDeviceFormatProperties2(device->adapter()->handle(),
+      createInfo.format, &formatProperties);
+
+    std::vector<VkDrmFormatModifierPropertiesEXT> modifierProperties(modifierList.drmFormatModifierCount);
+    modifierList.pDrmFormatModifierProperties = modifierProperties.data();
+
+    vki->vkGetPhysicalDeviceFormatProperties2(device->adapter()->handle(),
+      createInfo.format, &formatProperties);
+
+    // Format features the image usage requires of a modifier
+    VkFormatFeatureFlags requiredFormatFeatures = 0u;
+
+    if (createInfo.usage & VK_IMAGE_USAGE_SAMPLED_BIT)
+      requiredFormatFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (createInfo.usage & VK_IMAGE_USAGE_STORAGE_BIT)
+      requiredFormatFeatures |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+    if (createInfo.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+      requiredFormatFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    if (createInfo.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+      requiredFormatFeatures |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (createInfo.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+      requiredFormatFeatures |= VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    if (createInfo.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+      requiredFormatFeatures |= VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+
+    for (const auto& props : modifierProperties) {
+      if ((props.drmFormatModifierTilingFeatures & requiredFormatFeatures) != requiredFormatFeatures)
+        continue;
+
+      if (sharingInfo.mode == DxvkSharedHandleMode::Import
+       && props.drmFormatModifier != sharingInfo.dmabufModifier)
+        continue;
+
+      // Linear-forced exports (scanout consumers without modifier
+      // plumbing) accept only DRM_FORMAT_MOD_LINEAR.
+      if (sharingInfo.mode == DxvkSharedHandleMode::Export
+       && sharingInfo.dmabufForceLinear
+       && props.drmFormatModifier != 0u)
+        continue;
+
+      // Check whether images of this modifier support the parameters
+      VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT };
+      modifierInfo.drmFormatModifier = props.drmFormatModifier;
+      modifierInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+      VkPhysicalDeviceExternalImageFormatInfo externalInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, &modifierInfo };
+      externalInfo.handleType = sharingInfo.type;
+
+      VkPhysicalDeviceImageFormatInfo2 imageFormatInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &externalInfo };
+
+      // Mutable-format images with a modifier must come with a format list
+      VkImageFormatListCreateInfo queryFormatList = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
+      queryFormatList.viewFormatCount = uint32_t(m_viewFormats.size());
+      queryFormatList.pViewFormats = m_viewFormats.data();
+
+      if ((createInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && queryFormatList.viewFormatCount)
+        queryFormatList.pNext = std::exchange(externalInfo.pNext, &queryFormatList);
+      imageFormatInfo.format = createInfo.format;
+      imageFormatInfo.type = createInfo.imageType;
+      imageFormatInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+      imageFormatInfo.usage = createInfo.usage;
+      imageFormatInfo.flags = createInfo.flags;
+
+      VkExternalImageFormatProperties externalProperties = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+      VkImageFormatProperties2 imageFormatProperties = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &externalProperties };
+
+      VkResult queryResult = vki->vkGetPhysicalDeviceImageFormatProperties2(
+        device->adapter()->handle(), &imageFormatInfo, &imageFormatProperties);
+
+      if (queryResult != VK_SUCCESS) {
+        Logger::info(str::format("DxvkImage: modifier 0x", std::hex, props.drmFormatModifier, std::dec,
+          " rejected by image format query: ", queryResult));
+        continue;
+      }
+
+      const auto& limits = imageFormatProperties.imageFormatProperties;
+
+      if ((externalProperties.externalMemoryProperties.externalMemoryFeatures & requiredFeatures) != requiredFeatures
+       || createInfo.extent.width > limits.maxExtent.width
+       || createInfo.extent.height > limits.maxExtent.height
+       || createInfo.extent.depth > limits.maxExtent.depth
+       || createInfo.mipLevels > limits.maxMipLevels
+       || createInfo.arrayLayers > limits.maxArrayLayers)
+        continue;
+
+      m_dmabufModifiers.push_back({ props.drmFormatModifier, props.drmFormatModifierPlaneCount });
+    }
+
+    if (m_dmabufModifiers.empty()) {
+      std::stringstream advertised;
+
+      for (const auto& props : modifierProperties) {
+        advertised << "\n    modifier 0x" << std::hex << props.drmFormatModifier
+                   << " planes " << std::dec << props.drmFormatModifierPlaneCount
+                   << " features 0x" << std::hex << props.drmFormatModifierTilingFeatures << std::dec;
+      }
+
+      Logger::err(str::format("Failed to create dmabuf-shared resource: no usable modifier",
+        "\n  format:           ", createInfo.format,
+        "\n  usage:            0x", std::hex, createInfo.usage,
+        "\n  flags:            0x", createInfo.flags, std::dec,
+        "\n  mips/layers:      ", createInfo.mipLevels, " / ", createInfo.arrayLayers,
+        "\n  required features: 0x", std::hex, requiredFormatFeatures, std::dec,
+        "\n  required external: 0x", std::hex, requiredFeatures, std::dec,
+        "\n  advertised modifiers: ", modifierProperties.size(), advertised.str()));
+      return false;
+    }
+
+    // Exports leave the process, so prefer DRM_FORMAT_MOD_LINEAR over
+    // vendor specific (e.g. compressed) layouts when the driver offers it.
+    // Consumers without modifier support can then still read the buffer.
+    // DXVK_DMABUF_EXPORT_MODIFIERS=all hands the whole list to the driver.
+    if (sharingInfo.mode == DxvkSharedHandleMode::Export && m_dmabufModifiers.size() > 1u) {
+      const char* policy = std::getenv("DXVK_DMABUF_EXPORT_MODIFIERS");
+
+      if (!policy || std::strcmp(policy, "all")) {
+        auto linear = std::find_if(m_dmabufModifiers.begin(), m_dmabufModifiers.end(),
+          [] (const std::pair<uint64_t, uint32_t>& m) { return m.first == 0u; });
+
+        if (linear != m_dmabufModifiers.end()) {
+          auto keep = *linear;
+          m_dmabufModifiers.clear();
+          m_dmabufModifiers.push_back(keep);
+        }
+      }
+    }
+
+    {
+      std::stringstream usable;
+
+      for (const auto& m : m_dmabufModifiers)
+        usable << " 0x" << std::hex << m.first << std::dec << "/" << m.second << "pl";
+
+      Logger::info(str::format("DxvkImage: dmabuf modifiers offered to the driver for format ",
+        createInfo.format, ":", usable.str()));
+    }
+
+    if (sharingInfo.mode == DxvkSharedHandleMode::Import
+     && m_dmabufModifiers[0].second != sharingInfo.dmabufPlaneCount) {
+      Logger::err(str::format("Failed to import dmabuf-shared resource: plane count mismatch: descriptor ",
+        sharingInfo.dmabufPlaneCount, ", modifier requires ", m_dmabufModifiers[0].second));
+      return false;
+    }
+
+    return true;
+  }
+
+
+  VkResult DxvkImage::exportDmabufInfo(DxvkImageDmabufInfo* info) const {
+    if (!m_shared || !isDmabufShared()
+     || m_info.sharing.mode != DxvkSharedHandleMode::Export)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+
+#ifdef _WIN32
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+#else
+    DxvkResourceMemoryInfo memoryInfo = m_storage->getMemoryInfo();
+
+    // Shared images use dedicated allocations, the fd maps the
+    // whole memory object
+    if (memoryInfo.offset)
+      return VK_ERROR_UNKNOWN;
+
+    uint64_t modifier = 0u; /* DRM_FORMAT_MOD_LINEAR */
+    uint32_t planeCount = 1u;
+
+    if (m_dmabufUseModifiers) {
+      VkImageDrmFormatModifierPropertiesEXT modifierProps = { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT };
+
+      VkResult vr = m_vkd->vkGetImageDrmFormatModifierPropertiesEXT(
+        m_vkd->device(), handle(), &modifierProps);
+
+      if (vr != VK_SUCCESS)
+        return vr;
+
+      modifier = modifierProps.drmFormatModifier;
+      planeCount = 0u;
+
+      for (const auto& m : m_dmabufModifiers) {
+        if (m.first == modifier)
+          planeCount = m.second;
+      }
+
+      if (!planeCount || planeCount > info->planes.size())
+        return VK_ERROR_UNKNOWN;
+    }
+
+    for (uint32_t i = 0; i < planeCount; i++) {
+      VkImageSubresource subresource = { };
+      subresource.aspectMask = m_dmabufUseModifiers
+        ? VkImageAspectFlags(VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << i)
+        : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
+
+      m_vkd->vkGetImageSubresourceLayout(m_vkd->device(),
+        handle(), &subresource, &info->planes[i]);
+    }
+
+    VkMemoryGetFdInfoKHR fdInfo = { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
+    fdInfo.memory = memoryInfo.memory;
+    fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    int fd = -1;
+    VkResult vr = m_vkd->vkGetMemoryFdKHR(m_vkd->device(), &fdInfo, &fd);
+
+    if (vr != VK_SUCCESS)
+      return vr;
+
+    Logger::info(str::format("DxvkImage: exported dmabuf, format ", m_info.format,
+      ", ", m_info.extent.width, "x", m_info.extent.height,
+      ", modifier 0x", std::hex, modifier, std::dec, ", planes ", planeCount,
+      ", size ", memoryInfo.size, m_dmabufUseModifiers ? "" : " (linear fallback)"));
+
+    info->modifier = modifier;
+    info->planeCount = planeCount;
+    info->allocationSize = memoryInfo.size;
+    info->fd = fd;
+    return VK_SUCCESS;
+#endif
+  }
+
+
+  bool DxvkImage::canUseUnifiedLayout(const DxvkDevice& device) const {
+    if (m_unifiedLayoutAvailable)
+      return true;
+
+    // Always respect the config option if the extension is not supported
+    if (!device.config().enableUnifiedImageLayout)
+      return false;
+
+    // Speshul case
+    if (m_info.usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)
+      return false;
+
+    // On RDNA1/2 we can enable the unified path for everything
+    // that doesn't involve feedback loops or MSAA.
+    if (device.properties().vk12.driverID == VK_DRIVER_ID_MESA_RADV
+     && device.properties().vk13.minSubgroupSize == 32u)
+      return m_info.sampleCount == VK_SAMPLE_COUNT_1_BIT;
+
+    return false;
+  }
+
+
+
+
+
+  DxvkImageView::DxvkImageView(
+          DxvkImage*                image,
+    const DxvkImageViewKey&         key)
+  : m_image   (image),
+    m_key     (key) {
+    // If the view does not define a layout, figure out a suitable
+    // layout based on image view usage and image properties. This
+    // will be good enough in most situations.
+    if (!m_key.layout) {
+      switch (m_key.usage & ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) {
+        case VK_IMAGE_USAGE_SAMPLED_BIT:
+          m_key.layout = (m_image->formatInfo()->aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+            ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          break;
+
+        case VK_IMAGE_USAGE_STORAGE_BIT:
+          m_key.layout = VK_IMAGE_LAYOUT_GENERAL;
+          break;
+
+        case VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT:
+          m_key.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+          break;
+
+        case VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:
+          m_key.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+          break;
+
+        default:
+          break;
+      }
+    }
+
+    updateProperties();
+  }
+
+
+  DxvkImageView::~DxvkImageView() {
+
+  }
+
+
+  const DxvkDescriptor* DxvkImageView::createView(VkImageViewType type) const {
+    constexpr VkImageUsageFlags ViewUsage =
+      VK_IMAGE_USAGE_SAMPLED_BIT |
+      VK_IMAGE_USAGE_STORAGE_BIT |
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+
+    // Legalize view usage. We allow creating transfer-only view
+    // objects so that some internal APIs can be more consistent.
+    DxvkImageViewKey key = m_key;
+    key.viewType = type;
+    key.layout = getLayout();
+
+    if (!(key.usage & ViewUsage))
+      return nullptr;
+
+    // If the image has feedback loops enabled, forward the required
+    // usage flags to the view as well.
+    if (key.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+      if (m_image->info().usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)
+        key.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT | VK_IMAGE_USAGE_SAMPLED_BIT;
+
+      if (m_image->info().usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)
+        key.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+    }
+
+    // Only use one layer for non-arrayed view types
+    if (type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_2D)
+      key.layerCount = 1u;
+
+    switch (m_image->info().type) {
+      case VK_IMAGE_TYPE_1D: {
+        // Trivial, just validate that view types are compatible
+        if (type != VK_IMAGE_VIEW_TYPE_1D && type != VK_IMAGE_VIEW_TYPE_1D_ARRAY)
+          return nullptr;
+      } break;
+
+      case VK_IMAGE_TYPE_2D: {
+        if (type == VK_IMAGE_VIEW_TYPE_CUBE || type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {
+          // Ensure that the image is compatible with cube maps
+          if (key.layerCount < 6 || !(m_image->info().flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT))
+            return nullptr;
+
+          // Adjust layer count to make sure it's a multiple of 6
+          key.layerCount = type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
+            ? key.layerCount - key.layerCount % 6u : 6u;
+        } else if (type != VK_IMAGE_VIEW_TYPE_2D && type != VK_IMAGE_VIEW_TYPE_2D_ARRAY) {
+          return nullptr;
+        }
+      } break;
+
+      case VK_IMAGE_TYPE_3D: {
+        if (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_2D_ARRAY) {
+          // Ensure that the image is actually compatible with 2D views
+          if (!(m_image->info().flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT))
+            return nullptr;
+
+          // In case the view's native type is 3D, we can only create 2D compat
+          // views if there is only one mip and with the full set of array layers.
+          if (m_key.viewType == VK_IMAGE_VIEW_TYPE_3D) {
+            if (m_key.mipCount != 1u)
+              return nullptr;
+
+            key.layerIndex = 0u;
+            key.layerCount = type == VK_IMAGE_VIEW_TYPE_2D_ARRAY
+              ? m_image->mipLevelExtent(key.mipIndex).depth : 1u;
+          }
+        } else if (type != VK_IMAGE_VIEW_TYPE_3D) {
+          return nullptr;
+        }
+      } break;
+
+      default:
+        return nullptr;
+    }
+
+    // We need to expose RT and UAV swizzles to the backend,
+    // but cannot legally pass them down to Vulkan
+    if ((key.usage & ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) != VK_IMAGE_USAGE_SAMPLED_BIT)
+      key.packedSwizzle = 0u;
+
+    return m_image->m_storage->createImageView(key);
+  }
+
+
+  void DxvkImageView::updateViews() {
+    // Latch updated image properties
+    updateProperties();
+
+    // Update all views that are not currently null
+    for (uint32_t i = 0; i < m_views.size(); i++) {
+      if (m_views[i])
+        m_views[i] = createView(VkImageViewType(i));
+    }
+
+    m_version = m_image->m_version;
+  }
+
+
+  void DxvkImageView::updateProperties() {
+    m_properties.samples = m_image->info().sampleCount;
+    m_properties.access = m_image->info().access;
+  }
+
+}

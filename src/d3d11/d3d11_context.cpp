@@ -416,6 +416,72 @@ namespace dxvk {
 
   static bool nptIsA8R8(DXGI_FORMAT f) { return f == DXGI_FORMAT_A8_UNORM || (f >= DXGI_FORMAT_R8_TYPELESS && f <= DXGI_FORMAT_R8_SINT); }
 
+  // Compare completed GPU contents on each side of a shared atlas handoff.
+  // This is intentionally bounded and unsuitable for performance measurements.
+  static void nptTraceSharedAlphaPixels(ID3D11DeviceContext* ctx,
+      ID3D11Resource* resource, bool consumer) {
+    if (!nptImportReadTraceEnabled() || !resource)
+      return;
+
+    Com<ID3D11Texture2D> texture;
+    if (FAILED(resource->QueryInterface(__uuidof(ID3D11Texture2D),
+        reinterpret_cast<void**>(&texture))))
+      return;
+
+    D3D11_TEXTURE2D_DESC desc;
+    texture->GetDesc(&desc);
+    if ((desc.Format != DXGI_FORMAT_A8_UNORM && desc.Format != DXGI_FORMAT_R8_UNORM)
+     || desc.Width < 256 || desc.Height < 256
+     || uint64_t(desc.Width) * desc.Height > 4u * 1024u * 1024u
+     || desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1)
+      return;
+
+    auto image = GetCommonTexture(resource)->GetImage();
+    if (!image || image->info().sharing.mode != (consumer
+        ? DxvkSharedHandleMode::Import : DxvkSharedHandleMode::Export))
+      return;
+
+    static std::atomic<uint32_t> writes { 0 }, reads { 0 };
+    if ((consumer ? reads : writes).fetch_add(1, std::memory_order_relaxed) >= 8)
+      return;
+
+    Com<ID3D11Device> device;
+    texture->GetDevice(&device);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    Com<ID3D11Texture2D> staging;
+    HRESULT hr = device->CreateTexture2D(&desc, nullptr, &staging);
+    D3D11_MAPPED_SUBRESOURCE map = { };
+    if (SUCCEEDED(hr)) {
+      ctx->CopyResource(staging.ptr(), texture.ptr());
+      hr = ctx->Map(staging.ptr(), 0, D3D11_MAP_READ, 0, &map);
+    }
+
+    uint64_t hash = 14695981039346656037ull;
+    uint32_t nonzero = 0;
+    if (SUCCEEDED(hr)) {
+      for (uint32_t y = 0; y < desc.Height; y++) {
+        const auto* row = static_cast<const uint8_t*>(map.pData) + size_t(y) * map.RowPitch;
+        for (uint32_t x = 0; x < desc.Width; x++) {
+          hash = (hash ^ row[x]) * 1099511628211ull;
+          nonzero += row[x] != 0;
+        }
+      }
+      ctx->Unmap(staging.ptr(), 0);
+    }
+    const auto message = str::format("NPT-ALPHA-PIXELS pid=", getpid(),
+      " side=", consumer ? "import" : "export", " resource=", resource,
+      " image=", image->handle(), " size=", desc.Width, "x", desc.Height,
+      " hr=", std::hex, uint32_t(hr), " hash=", hash, std::dec,
+      " nonzero=", nonzero);
+#if defined(__ANDROID__)
+    __android_log_write(ANDROID_LOG_INFO, "NptAlphaPixels", message.c_str());
+#endif
+    Logger::info(message);
+  }
+
   static void nptDumpTexture(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, const char* tag) {
     auto& d = nptA8();
     D3D11_TEXTURE2D_DESC desc; tex->GetDesc(&desc);
@@ -632,6 +698,8 @@ namespace dxvk {
         const bool done = NptTinySync(r.ptr());
         nptTraceSharedGuard("source-read-before-draw", this, m_device.ptr(), r.ptr(), done);
         nptTraceImportRead(this, m_device.ptr(), r.ptr(), traceDrawSeq, outputs, done);
+        if (done)
+          nptTraceSharedAlphaPixels(static_cast<ID3D11DeviceContext*>(this), r.ptr(), true);
       }
     }
   }
@@ -658,6 +726,8 @@ namespace dxvk {
             const bool tinyDone = NptTinySync(r.ptr());
             done |= tinyDone;
             nptTraceSharedGuard("destination-write-after-op", this, m_device.ptr(), r.ptr(), tinyDone);
+            if (tinyDone)
+              nptTraceSharedAlphaPixels(static_cast<ID3D11DeviceContext*>(this), r.ptr(), false);
           }
         } else {
           m_nptTouched.clear();

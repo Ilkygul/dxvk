@@ -3485,6 +3485,26 @@ namespace dxvk {
     VkDeviceSize dataSize = imageSubresource.layerCount * util::computeImageDataSize(
       image->info().format, imageExtent, imageSubresource.aspectMask);
 
+    // A pitched 2D copy accesses the gaps between rows as part of its
+    // buffer range. Track through the last byte of the last row.
+    const auto* format = image->formatInfo();
+
+    if (image->info().type == VK_IMAGE_TYPE_2D
+     && imageSubresource.layerCount == 1
+     && imageSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT
+     && format->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT
+     && !format->flags.test(DxvkFormatFlag::MultiPlane)
+     && format->blockSize.width == 1
+     && format->blockSize.height == 1
+     && imageExtent.height > 1) {
+      const VkDeviceSize rowBytes = VkDeviceSize(imageExtent.width) * format->elementSize;
+      if (bufferRowAlignment > format->elementSize) {
+        const VkDeviceSize pitch = bufferRowAlignment >= rowBytes
+          ? bufferRowAlignment : align(rowBytes, bufferRowAlignment);
+        dataSize = pitch * (imageExtent.height - 1) + rowBytes;
+      }
+    }
+
     // We may copy to only one aspect at a time, but pipeline
     // barriers need to have all available aspect bits set
     auto dstFormatInfo = image->formatInfo();
@@ -3790,6 +3810,26 @@ namespace dxvk {
 
     VkDeviceSize dataSize = imageSubresource.layerCount * util::computeImageDataSize(
       image->info().format, imageExtent, imageSubresource.aspectMask);
+
+    // A pitched 2D copy accesses the gaps between rows as part of its
+    // buffer range. Track through the last byte of the last row.
+    const auto* format = image->formatInfo();
+
+    if (image->info().type == VK_IMAGE_TYPE_2D
+     && imageSubresource.layerCount == 1
+     && imageSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT
+     && format->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT
+     && !format->flags.test(DxvkFormatFlag::MultiPlane)
+     && format->blockSize.width == 1
+     && format->blockSize.height == 1
+     && imageExtent.height > 1) {
+      const VkDeviceSize rowBytes = VkDeviceSize(imageExtent.width) * format->elementSize;
+      if (bufferRowAlignment > format->elementSize) {
+        const VkDeviceSize pitch = bufferRowAlignment >= rowBytes
+          ? bufferRowAlignment : align(rowBytes, bufferRowAlignment);
+        dataSize = pitch * (imageExtent.height - 1) + rowBytes;
+      }
+    }
 
     auto bufferSlice = buffer->getSliceInfo(bufferOffset, dataSize);
 

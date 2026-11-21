@@ -368,12 +368,18 @@ namespace dxvk {
     auto image = texture ? texture->GetImage() : Rc<DxvkImage>();
     if (!image || image->info().sharing.mode != DxvkSharedHandleMode::Import) return;
     const auto& info = image->info();
-    static std::atomic<uint64_t> imports { 0 }, lateTargets { 0 };
+    static std::atomic<uint64_t> imports { 0 }, lateTargets { 0 }, lateAlpha { 0 };
     const uint64_t importSeq = imports.fetch_add(1, std::memory_order_relaxed);
     const bool target960 = info.extent.width == 960 && info.extent.height == 640;
     uint64_t targetSeq = 0;
     bool sampledTarget = false;
-    if (importSeq >= 128) {
+    const bool alphaFormat = info.format == VK_FORMAT_R8_UNORM
+                          || info.format == VK_FORMAT_A8_UNORM_KHR;
+    // Keep an independent budget for alpha-mask candidates imported after
+    // the compositor's initial burst. R8 may represent remapped A8.
+    const bool sampledAlpha = importSeq >= 128 && alphaFormat
+      && lateAlpha.fetch_add(1, std::memory_order_relaxed) < 64;
+    if (importSeq >= 128 && !sampledAlpha) {
       if (!target960) return;
       targetSeq = lateTargets.fetch_add(1, std::memory_order_relaxed);
       // At most 64 later records: one per 120 qualifying target reads.
@@ -384,7 +390,7 @@ namespace dxvk {
     const auto message = str::format("NPT-IMPORT-READ pid=", getpid(),
       " context=", context, " device=", device, " drawSeq=", drawSeq,
       " importSeq=", importSeq, " target960=", target960,
-      " sampledTarget=", sampledTarget, " targetSeq=", targetSeq,
+      " sampledTarget=", sampledTarget, " sampledAlpha=", sampledAlpha, " targetSeq=", targetSeq,
       " resource=", resource, " image=", image->handle(),
       " sharing=Import sharingEnum=", uint32_t(info.sharing.mode),
       " handleType=", uint32_t(info.sharing.type), " format=", uint32_t(info.format),

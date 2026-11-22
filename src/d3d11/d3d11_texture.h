@@ -105,6 +105,8 @@ namespace dxvk {
     ~D3D11CommonTexture();
 
 #ifdef __ANDROID__
+    static bool IsVideoHandoffSize(UINT width, UINT height, bool exportNegotiation);
+
     int dmabufPublicationFd() const { return m_image->dmabufPublicationFd(); }
 #endif
 

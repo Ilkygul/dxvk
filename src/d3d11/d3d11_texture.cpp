@@ -1015,7 +1015,7 @@ namespace dxvk {
         && m_desc.Usage == D3D11_USAGE_DEFAULT;
       static const bool videoOwnership = env::getEnvVar("NPT_DMABUF_VIDEO_HANDOFF") == "1";
       const bool video = videoOwnership && info.format == VK_FORMAT_B8G8R8A8_UNORM
-        && m_desc.Width == 1856 && m_desc.Height == 1728
+        && IsVideoHandoffSize(m_desc.Width, m_desc.Height, true)
         && m_desc.MipLevels == 1 && m_desc.ArraySize == 1
         && m_desc.SampleDesc.Count == 1 && m_desc.CPUAccessFlags == 0
         && m_desc.Usage == D3D11_USAGE_DEFAULT
@@ -1026,6 +1026,18 @@ namespace dxvk {
         descriptor.reserved = DmabufPublicationTag | uint32_t(dmabufPublicationFd());
     }
 #endif
+  }
+#endif
+
+
+#ifdef __ANDROID__
+  bool D3D11CommonTexture::IsVideoHandoffSize(UINT width, UINT height, bool exportNegotiation) {
+    static const bool extended = env::getEnvVar("NPT_DMABUF_VIDEO_HANDOFF_EXTENDED") == "1";
+    static const bool edgeWorker = env::getEnvVar("NPT_DMABUF_EDGE_WORKER") == "1";
+    // Only the Edge worker may negotiate new sizes. At use time both workers
+    // must still check the companion protocol before dropping the legacy wait.
+    return (width == 1856 && height == 1728) ||
+      (extended && (!exportNegotiation || edgeWorker) && width >= 1600 && height >= 1000);
   }
 #endif
 

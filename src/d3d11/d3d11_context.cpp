@@ -573,7 +573,7 @@ namespace dxvk {
         const bool atlas = gpuAtlas && format == VK_FORMAT_R8_UNORM &&
           d->Width == 1248 && d->Height == 1344;
         const bool video = gpuVideo && format == VK_FORMAT_B8G8R8A8_UNORM &&
-          d->Width == 1856 && d->Height == 1728 &&
+          D3D11CommonTexture::IsVideoHandoffSize(d->Width, d->Height, false) &&
           sharing == (producer ? DxvkSharedHandleMode::Export : DxvkSharedHandleMode::Import);
         if (executeOwnership && (atlas || video) && t->dmabufPublicationFd() >= 0) {
           char phase = 0;

@@ -178,6 +178,22 @@ namespace dxvk {
 
     void SynchronizeDevice();
     void NptSharedSyncNow();
+    VkResult NptWaitForAtlasPublication();
+    bool NptPublishTinyCopy(ID3D11Resource* staging, ID3D11Resource* source,
+      const D3D11_BOX* box, bool producer);
+#ifdef __ANDROID__
+    bool NptAcquireWrite(D3D11CommonTexture* texture);
+    void NptReleaseWrite();
+
+  private:
+    int m_nptWriteLock = -1;
+    int m_nptWriteDma = -1;
+    uint64_t m_nptWriteInode = 0;
+    bool m_nptWriteReturnsFromRead = false;
+    int m_nptWriteDependencyReady = -1;
+    Rc<DxvkSyncFileSignal> m_nptWriteRelease;
+  public:
+#endif
 
     void EndFrame(
             Rc<DxvkLatencyTracker>      LatencyTracker);
@@ -209,7 +225,9 @@ namespace dxvk {
     void ExecuteFlush(
             GpuFlushType                FlushType,
             HANDLE                      hEvent,
-            BOOL                        Synchronize);
+            BOOL                        Synchronize,
+      const Rc<DxvkSyncFileSignal>&      SyncFileSignal = nullptr,
+            bool                        WaitForPublication = false);
 
     void ThrottleAllocation();
 

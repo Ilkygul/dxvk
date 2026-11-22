@@ -103,6 +103,11 @@ namespace dxvk {
             HANDLE                      hSharedHandle);
     
     ~D3D11CommonTexture();
+
+#ifdef __ANDROID__
+    int dmabufPublicationFd() const { return m_image->dmabufPublicationFd(); }
+#endif
+
     
     /**
      * \brief Retrieves resource interface

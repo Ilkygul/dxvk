@@ -5,6 +5,8 @@
 #ifndef _WIN32
 #include <algorithm>
 #include <cstdlib>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <cstring>
 #include <sstream>
 #include <unistd.h>
@@ -226,6 +228,10 @@ namespace dxvk {
 
     try {
       assignStorage(allocateStorage());
+#ifndef _WIN32
+      if (m_shared && isDmabufShared() && m_info.sharing.mode == DxvkSharedHandleMode::Import)
+        m_dmabufImportFd = fcntl(m_info.sharing.fd, F_DUPFD_CLOEXEC, 0);
+#endif
     } catch (...) {
       m_allocator->unregisterResource(this);
       throw;
@@ -259,7 +265,26 @@ namespace dxvk {
   }
 
 
+#ifdef __ANDROID__
+  void DxvkImage::setDmabufPublicationFd(int fd) {
+    if (m_dmabufPublicationFd >= 0)
+      close(m_dmabufPublicationFd);
+
+    m_dmabufPublicationFd = fd;
+    struct stat identity;
+    m_dmabufPublicationInode = fd >= 0 && fstat(fd, &identity) == 0 ? identity.st_ino : 0;
+  }
+#endif
+
   DxvkImage::~DxvkImage() {
+#ifdef __ANDROID__
+    if (m_dmabufPublicationFd >= 0)
+      close(m_dmabufPublicationFd);
+#endif
+#ifndef _WIN32
+    if (m_dmabufImportFd >= 0)
+      close(m_dmabufImportFd);
+#endif
     m_allocator->unregisterResource(this);
   }
 
@@ -1016,6 +1041,35 @@ namespace dxvk {
   }
 
 
+  VkResult DxvkImage::dupDmabufFd(int* fd) const {
+    *fd = -1;
+#ifndef _WIN32
+    if (m_shared && isDmabufShared()) {
+      if (m_info.sharing.mode == DxvkSharedHandleMode::Import) {
+        if (m_dmabufImportFd < 0)
+          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+        *fd = fcntl(m_dmabufImportFd, F_DUPFD_CLOEXEC, 0);
+        return *fd >= 0 ? VK_SUCCESS : VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      }
+
+      if (m_info.sharing.mode == DxvkSharedHandleMode::Export) {
+        const auto memory = m_storage->getMemoryInfo();
+
+        if (memory.offset)
+          return VK_ERROR_UNKNOWN;
+
+        VkMemoryGetFdInfoKHR info = { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
+        info.memory = memory.memory;
+        info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        return m_vkd->vkGetMemoryFdKHR(m_vkd->device(), &info, fd);
+      }
+    }
+#endif
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+
+
   VkResult DxvkImage::exportDmabufInfo(DxvkImageDmabufInfo* info) const {
     if (!m_shared || !isDmabufShared()
      || m_info.sharing.mode != DxvkSharedHandleMode::Export)
@@ -1065,12 +1119,8 @@ namespace dxvk {
         handle(), &subresource, &info->planes[i]);
     }
 
-    VkMemoryGetFdInfoKHR fdInfo = { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
-    fdInfo.memory = memoryInfo.memory;
-    fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-
     int fd = -1;
-    VkResult vr = m_vkd->vkGetMemoryFdKHR(m_vkd->device(), &fdInfo, &fd);
+    VkResult vr = dupDmabufFd(&fd);
 
     if (vr != VK_SUCCESS)
       return vr;

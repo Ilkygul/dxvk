@@ -672,6 +672,15 @@ namespace dxvk {
      */
     VkResult exportDmabufInfo(DxvkImageDmabufInfo* info) const;
 
+    // Returns a close-on-exec descriptor owned by the caller.
+    // Import descriptors remain valid after the host closes its temporary FD.
+    VkResult dupDmabufFd(int* fd) const;
+#ifdef __ANDROID__
+    void setDmabufPublicationFd(int fd);
+    int dmabufPublicationFd() const { return m_dmabufPublicationFd; }
+    uint64_t dmabufPublicationInode() const { return m_dmabufPublicationInode; }
+#endif
+
     /**
      * \brief Retrives sparse page table
      * \returns Page table
@@ -889,6 +898,11 @@ namespace dxvk {
     // Dmabuf sharing: whether images use DRM format modifier tiling,
     // and the (modifier, memory plane count) pairs usable for export
     // or describing the imported image.
+    int                         m_dmabufImportFd = -1;
+#ifdef __ANDROID__
+    int                         m_dmabufPublicationFd = -1;
+    uint64_t                    m_dmabufPublicationInode = 0;
+#endif
     bool                        m_dmabufUseModifiers = false;
     std::vector<std::pair<uint64_t, uint32_t>> m_dmabufModifiers;
 

@@ -1,3 +1,9 @@
+#ifdef __ANDROID__
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include "d3d11_device.h"
 #include "d3d11_context_imm.h"
 #include "d3d11_gdi.h"
@@ -11,6 +17,53 @@
 #endif
 
 namespace dxvk {
+
+#ifdef __ANDROID__
+  // Process-local companion tag. Never copy this integer to a guest wire descriptor.
+  constexpr uint32_t DmabufPublicationTag = 0x80000000u;
+
+  static int openDmabufPublication(int fd) {
+    auto path = str::format("/proc/self/fd/", fd);
+    int independent = open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (independent < 0)
+      return -1;
+
+    constexpr int required = F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+    const int seals = fcntl(independent, F_GET_SEALS);
+    char state;
+    if (seals < 0 || (seals & required) != required
+     || pread(independent, &state, 1, 0) != 1) {
+      close(independent);
+      return -1;
+    }
+    const bool ownership = state == 'L' || state == 'E' || state == 'X';
+    const bool legacy = state == 'C' || state == 'D' || state == 'R';
+    static const bool execute = env::getEnvVar("NPT_DMABUF_EXECUTE_OWNERSHIP") == "1";
+    if (ownership && !execute) {
+      close(independent);
+      throw DxvkError("DXVK: shared image requires negotiated external ownership");
+    }
+    if (!legacy && !ownership) {
+      close(independent);
+      return -1;
+    }
+    return independent;
+  }
+
+  static int createDmabufPublication(char phase) {
+    int fd = memfd_create("dxvk-dmabuf-publication", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0)
+      return -1;
+
+    constexpr int seals = F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+    if (pwrite(fd, &phase, 1, 0) != 1 || fcntl(fd, F_ADD_SEALS, seals) < 0) {
+      close(fd);
+      return -1;
+    }
+    return fd;
+  }
+#endif
+
   
   D3D11CommonTexture::D3D11CommonTexture(
           ID3D11Resource*             pInterface,
@@ -323,6 +376,19 @@ namespace dxvk {
       BuildSharedDescriptor();
 #endif
     }
+#ifdef __ANDROID__
+    if (imageInfo.sharing.mode == DxvkSharedHandleMode::Import) {
+      const auto* descriptor = reinterpret_cast<const dxn_shared_texture*>(hSharedHandle);
+      if (descriptor->reserved & DmabufPublicationTag) {
+        m_image->setDmabufPublicationFd(openDmabufPublication(int(descriptor->reserved & ~DmabufPublicationTag)));
+        static std::atomic<unsigned> seen = 0;
+        if (seen.fetch_add(1, std::memory_order_relaxed) < 8)
+          Logger::warn(str::format("NPT-DMABUF-PUBLICATION stage=texture-import pid=", getpid(),
+            " accepted=", dmabufPublicationFd() >= 0, " width=", m_desc.Width,
+            " height=", m_desc.Height));
+      }
+    }
+#endif
   }
 
 
@@ -929,6 +995,37 @@ namespace dxvk {
 
     descriptor.size = dmabufInfo.allocationSize;
     descriptor.fd = dmabufInfo.fd;
+#ifdef __ANDROID__
+    static const bool publication = env::getEnvVar("NPT_DMABUF_PUBLICATION_DESCRIPTOR") == "1";
+    if (publication) {
+      const bool fixture = env::getEnvVar("NPT_DMABUF_FIXTURE_WORKER") == "1"
+        && m_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM
+        && m_desc.Width == 960 && m_desc.Height == 640
+        && m_desc.MipLevels == 1 && m_desc.ArraySize == 1
+        && m_desc.SampleDesc.Count == 1 && m_desc.CPUAccessFlags == 0
+        && m_desc.Usage == D3D11_USAGE_DEFAULT
+        && m_desc.BindFlags == D3D11_BIND_SHADER_RESOURCE
+        && m_desc.MiscFlags == D3D11_RESOURCE_MISC_SHARED;
+      static const bool atlasOwnership = env::getEnvVar("NPT_DMABUF_SETTINGS_ATLAS") == "1";
+      const auto& info = m_image->info();
+      const bool atlas = atlasOwnership && info.format == VK_FORMAT_R8_UNORM
+        && m_desc.Width == 1248 && m_desc.Height == 1344
+        && m_desc.MipLevels == 1 && m_desc.ArraySize == 1
+        && m_desc.SampleDesc.Count == 1 && m_desc.CPUAccessFlags == 0
+        && m_desc.Usage == D3D11_USAGE_DEFAULT;
+      static const bool videoOwnership = env::getEnvVar("NPT_DMABUF_VIDEO_HANDOFF") == "1";
+      const bool video = videoOwnership && info.format == VK_FORMAT_B8G8R8A8_UNORM
+        && m_desc.Width == 1856 && m_desc.Height == 1728
+        && m_desc.MipLevels == 1 && m_desc.ArraySize == 1
+        && m_desc.SampleDesc.Count == 1 && m_desc.CPUAccessFlags == 0
+        && m_desc.Usage == D3D11_USAGE_DEFAULT
+        && m_desc.MiscFlags == D3D11_RESOURCE_MISC_SHARED
+        && m_desc.BindFlags == (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+      m_image->setDmabufPublicationFd(createDmabufPublication(fixture || atlas || video ? 'L' : 'C'));
+      if (dmabufPublicationFd() >= 0)
+        descriptor.reserved = DmabufPublicationTag | uint32_t(dmabufPublicationFd());
+    }
+#endif
   }
 #endif
 

@@ -1,8 +1,188 @@
+#ifdef __ANDROID__
+#include <unistd.h>
+#include <fcntl.h>
+#include <linux/dma-buf.h>
+#include <linux/sync_file.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
+#include "../util/util_env.h"
+#endif
+
 
 #include "dxvk_cmdlist.h"
 #include "dxvk_device.h"
 
 namespace dxvk {
+
+#ifdef __ANDROID__
+  void DxvkCommandList::trackPublicationImage(DxvkImage* image, DxvkAccess access) {
+    static const bool enabled = env::getEnvVar("NPT_DMABUF_TRACE_COMMAND_LIST") == "1" ||
+      env::getEnvVar("NPT_DMABUF_EXECUTE_OWNERSHIP") == "1";
+    if (!enabled)
+      return;
+
+    for (auto& entry : m_publicationImages) {
+      if (entry.image.ptr() == image) {
+        entry.read |= access == DxvkAccess::Read;
+        entry.write |= access == DxvkAccess::Write;
+        return;
+      }
+    }
+
+    m_publicationImages.push_back(PublicationImage {
+      Rc<DxvkImage>(image), access == DxvkAccess::Read, access == DxvkAccess::Write });
+  }
+
+
+  void DxvkCommandList::capturePublicationImageLayout(
+          DxvkImage* image, VkImageLayout layout, bool localInitialization) {
+    if (!image->dmabufPublicationInode())
+      return;
+
+    for (const auto& entry : m_publicationImages) {
+      if (entry.image.ptr() == image)
+        return; // Preserve the first observation, including an unknown start.
+    }
+
+    static const bool enabled = env::getEnvVar("NPT_DMABUF_TRACE_COMMAND_LIST") == "1" ||
+      env::getEnvVar("NPT_DMABUF_EXECUTE_OWNERSHIP") == "1";
+    if (enabled)
+      m_publicationImages.push_back(PublicationImage {
+        Rc<DxvkImage>(image), false, false, layout, localInitialization });
+  }
+
+
+  void DxvkCommandList::recordPublicationOwnership() {
+    static const bool execute = env::getEnvVar("NPT_DMABUF_EXECUTE_OWNERSHIP") == "1";
+    static const bool trace = env::getEnvVar("NPT_DMABUF_RECORD_OWNERSHIP") == "1";
+    if ((!execute && !trace) || m_publicationImages.empty())
+      return;
+
+    const auto skip = [&] (const char* reason) {
+      if (!execute)
+        return;
+      for (const auto& entry : m_publicationImages) {
+        char phase = 0;
+        if (!entry.read && !entry.write)
+          continue;
+        if (pread(entry.image->dmabufPublicationFd(), &phase, 1, 0) == 1 &&
+            (phase == 'C' || phase == 'R' || phase == 'D'))
+          continue;
+        Logger::err(str::format("NPT-DMABUF-OWNERSHIP-RECORD-SKIP pid=", getpid(),
+          " reason=", reason, " inode=", entry.image->dmabufPublicationInode(),
+          " phase=", int(phase), " start=", int(entry.startLayout),
+          " end=", int(entry.image->queryLayout(entry.image->getAvailableSubresources())),
+          " local_init=", entry.localInitialization, " read=", entry.read, " write=", entry.write,
+          " lists=", m_cmdSubmissions.size()));
+      }
+    };
+
+    if (m_device->hasDedicatedTransferQueue())
+      return skip("dedicated-transfer");
+
+    // On a single queue, SDMA commands already follow the graphics
+    // acquire and precede the graphics release in submission order.
+    for (const auto& submission : m_cmdSubmissions) {
+      if (submission.sparseBind)
+        return skip("sparse-bind");
+    }
+
+    // These are recorded for validation only. Execution additionally needs a
+    // negotiated image protocol and the start layout captured before access.
+    small_vector<VkImageMemoryBarrier2, 4> acquireBarriers;
+    small_vector<VkImageMemoryBarrier2, 4> releaseBarriers;
+    const uint32_t family = m_device->queues().graphics.queueFamily;
+    static const bool atlasOwnership = env::getEnvVar("NPT_DMABUF_SETTINGS_ATLAS") == "1";
+    for (const auto& entry : m_publicationImages) {
+      const auto& image = *entry.image;
+      const auto& info = image.info();
+      if (!entry.read && !entry.write)
+        continue;
+
+      if (execute) {
+        char phase = 0;
+        if (pread(image.dmabufPublicationFd(), &phase, 1, 0) != 1)
+          return skip("read-phase");
+        if (phase == 'C' || phase == 'R' || phase == 'D')
+          continue;
+        if (phase != 'L' && phase != 'E' && phase != 'X')
+          return skip("phase");
+      }
+
+      const bool localStart = entry.localInitialization &&
+        info.sharing.mode == DxvkSharedHandleMode::Export &&
+        (entry.startLayout == VK_IMAGE_LAYOUT_UNDEFINED ||
+         entry.startLayout == VK_IMAGE_LAYOUT_PREINITIALIZED);
+      const bool fixture = env::getEnvVar("NPT_DMABUF_FIXTURE_WORKER") == "1"
+        && info.format == VK_FORMAT_R8G8B8A8_UNORM
+        && info.extent.width == 960 && info.extent.height == 640;
+      const bool largeBgra = info.format == VK_FORMAT_B8G8R8A8_UNORM
+        && info.extent.width >= 1600 && info.extent.height >= 1000;
+      const bool atlas = atlasOwnership && info.format == VK_FORMAT_R8_UNORM
+        && info.extent.width == 1248 && info.extent.height == 1344;
+      if (!localStart && entry.startLayout != VK_IMAGE_LAYOUT_GENERAL)
+        return skip("start-layout");
+      if ((!fixture && !largeBgra && !atlas) || info.mipLevels != 1 || info.numLayers != 1)
+        return skip("image-shape");
+      if (info.layout != VK_IMAGE_LAYOUT_GENERAL ||
+          image.queryLayout(image.getAvailableSubresources()) != VK_IMAGE_LAYOUT_GENERAL)
+        return skip("end-layout");
+
+      VkImageMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT |
+        (entry.write ? VK_ACCESS_2_MEMORY_WRITE_BIT : VkAccessFlags2(0));
+      barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+      barrier.dstQueueFamilyIndex = family;
+      barrier.image = image.handle();
+      barrier.subresourceRange = image.getAvailableSubresources();
+      if (!localStart)
+        acquireBarriers.push_back(barrier);
+
+      std::swap(barrier.srcStageMask, barrier.dstStageMask);
+      std::swap(barrier.srcAccessMask, barrier.dstAccessMask);
+      std::swap(barrier.srcQueueFamilyIndex, barrier.dstQueueFamilyIndex);
+      releaseBarriers.push_back(barrier);
+    }
+
+    static thread_local unsigned sampled = 0;
+    if ((!execute && sampled >= 16) || releaseBarriers.empty())
+      return;
+    sampled++;
+
+    auto vk = m_device->vkd();
+    VkDependencyInfo dependency = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    try {
+      VkCommandBuffer acquire = VK_NULL_HANDLE;
+      if (!acquireBarriers.empty()) {
+        dependency.imageMemoryBarrierCount = acquireBarriers.size();
+        dependency.pImageMemoryBarriers = acquireBarriers.data();
+        acquire = m_graphicsPool->getCommandBuffer(DxvkCmdBuffer::Count);
+        vk->vkCmdPipelineBarrier2(acquire, &dependency);
+        if (vk->vkEndCommandBuffer(acquire) != VK_SUCCESS)
+          return skip("end-acquire-buffer");
+      }
+
+      dependency.imageMemoryBarrierCount = releaseBarriers.size();
+      dependency.pImageMemoryBarriers = releaseBarriers.data();
+      const auto release = m_graphicsPool->getCommandBuffer(DxvkCmdBuffer::Count);
+      vk->vkCmdPipelineBarrier2(release, &dependency);
+      const VkResult releaseStatus = vk->vkEndCommandBuffer(release);
+      if (releaseStatus != VK_SUCCESS)
+        return skip("end-release-buffer");
+
+      m_publicationAcquire = acquire;
+      m_publicationRelease = release;
+      if (sampled <= 16)
+        Logger::warn(str::format("NPT-DMABUF-OWNERSHIP-RECORDED pid=", getpid(),
+          " graphics_family=", family, " acquire=", acquireBarriers.size(), " release=", releaseBarriers.size()));
+    } catch (const DxvkError& error) {
+      Logger::warn(error.message());
+    }
+  }
+#endif
 
   DxvkCommandSubmission::DxvkCommandSubmission() {
 
@@ -259,6 +439,169 @@ namespace dxvk {
     const auto& transfer = m_device->queues().transfer;
     const auto& sparse = m_device->queues().sparse;
 
+#ifdef __ANDROID__
+    static const bool traceLayouts = env::getEnvVar("NPT_DMABUF_TRACE_SETTINGS_LAYOUT") == "1";
+    if (!m_publicationImages.empty()) {
+      unsigned transferCmds = 0;
+      unsigned initCmds = 0;
+      unsigned graphicsCmds = 0;
+      unsigned sparseOps = 0;
+      for (const auto& cmd : m_cmdSubmissions) {
+        for (const auto buffer : SdmaCmdBuffers)
+          transferCmds += cmd.cmdBuffers[uint32_t(buffer)] != VK_NULL_HANDLE;
+        for (const auto buffer : InitCmdBuffers)
+          initCmds += cmd.cmdBuffers[uint32_t(buffer)] != VK_NULL_HANDLE;
+        graphicsCmds += cmd.execCommands;
+        sparseOps += cmd.sparseBind;
+      }
+      static thread_local unsigned samples = 0;
+      if (samples < (traceLayouts ? 384u : 64u)) {
+        for (const auto& entry : m_publicationImages) {
+          const auto& image = *entry.image;
+          const auto& info = image.info();
+          if (!traceLayouts && (info.extent.width < 1600 || info.extent.height < 1000))
+            continue;
+
+          Logger::warn(str::format("NPT-DMABUF-CMDLIST pid=", getpid(), " submission=", trackedId,
+            " inode=", image.dmabufPublicationInode(), " read=", entry.read, " write=", entry.write,
+            " width=", info.extent.width, " height=", info.extent.height,
+            " sharing=", int(info.sharing.mode), " format=", int(info.format),
+            " start=", int(entry.startLayout),
+            " end=", int(image.queryLayout(image.getAvailableSubresources())),
+            " images=", m_publicationImages.size(),
+            " transfer=", transferCmds, " init=", initCmds, " graphics=", graphicsCmds,
+            " sparse=", sparseOps, " separate=", m_device->hasDedicatedTransferQueue()));
+        }
+        samples++;
+      }
+    }
+#endif
+#ifdef __ANDROID__
+    struct OwnedFd {
+      int fd = -1;
+      ~OwnedFd() { if (fd >= 0) close(fd); }
+    };
+
+    const auto failOwnership = [this] (const char* operation, VkResult reason = VK_ERROR_UNKNOWN) {
+      Logger::err(str::format("NPT-DMABUF-OWNERSHIP-REJECT pid=", getpid(),
+        " operation=", operation, " result=", int(reason)));
+      // VK_ERROR_DEVICE_LOST manufactured by this protocol makes the queue
+      // skip normal retirement. Drain the actual device before reporting it
+      // so submitted buffers and semaphores cannot be destroyed in flight.
+      if (reason != VK_ERROR_DEVICE_LOST) {
+        auto vk = m_device->vkd();
+        const VkResult drained = vk->vkDeviceWaitIdle(vk->device());
+        if (drained != VK_SUCCESS && drained != VK_ERROR_DEVICE_LOST) {
+          Logger::err(str::format("DXVK DMA-BUF ownership: device drain failed: ", int(drained)));
+          return drained;
+        }
+      }
+      return VK_ERROR_DEVICE_LOST;
+    };
+
+    struct LockedPublication {
+      OwnedFd lock;
+      OwnedFd dma;
+    };
+    std::vector<const PublicationImage*> ownedImages;
+    std::vector<LockedPublication> publications;
+    bool executePublication = false;
+    static const bool execute = env::getEnvVar("NPT_DMABUF_EXECUTE_OWNERSHIP") == "1";
+    if (execute) {
+      for (const auto& entry : m_publicationImages) {
+        if (!entry.read && !entry.write)
+          continue;
+
+        char phase = 0;
+        if (pread(entry.image->dmabufPublicationFd(), &phase, 1, 0) != 1)
+          return failOwnership("read-phase");
+        if (phase == 'C' || phase == 'R' || phase == 'D')
+          continue;
+        if ((phase != 'L' && phase != 'E' && phase != 'X') || !m_publicationRelease)
+          return failOwnership("unsupported-command-list");
+        ownedImages.push_back(&entry);
+      }
+
+      if (!ownedImages.empty()) {
+        if (m_syncFileWait || m_syncFileSignal)
+          return failOwnership("conflicting-sync-file");
+
+        // Every worker locks the companion descriptors in the same order.
+        const auto inode = [] (const PublicationImage* entry) {
+          return entry->image->dmabufPublicationInode();
+        };
+        std::sort(ownedImages.begin(), ownedImages.end(),
+          [&] (const auto* a, const auto* b) { return inode(a) < inode(b); });
+        for (size_t i = 1; i < ownedImages.size(); i++) {
+          if (inode(ownedImages[i-1]) == inode(ownedImages[i]))
+            return failOwnership("duplicate-publication-identity");
+        }
+
+        publications = std::vector<LockedPublication>(ownedImages.size());
+        OwnedFd dependency;
+        for (size_t i = 0; i < ownedImages.size(); i++) {
+          const auto& entry = *ownedImages[i];
+          auto& publication = publications[i];
+          const auto path = str::format("/proc/self/fd/", entry.image->dmabufPublicationFd());
+          publication.lock.fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+          if (publication.lock.fd < 0 || flock(publication.lock.fd, LOCK_EX) < 0)
+            return failOwnership("lock-companion");
+
+          const bool localStart = entry.localInitialization &&
+            entry.image->info().sharing.mode == DxvkSharedHandleMode::Export &&
+            (entry.startLayout == VK_IMAGE_LAYOUT_UNDEFINED ||
+             entry.startLayout == VK_IMAGE_LAYOUT_PREINITIALIZED);
+          char phase = 0;
+          if (pread(publication.lock.fd, &phase, 1, 0) != 1 ||
+              phase != (localStart ? 'L' : 'E') ||
+              (!localStart && !m_publicationAcquire) ||
+              entry.image->dupDmabufFd(&publication.dma.fd) != VK_SUCCESS)
+            return failOwnership("validate-locked-phase");
+          if (phase != 'E')
+            continue;
+
+          // External ownership is exclusive even for shader reads.
+          dma_buf_export_sync_file snapshot { DMA_BUF_SYNC_WRITE, -1 };
+          if (ioctl(publication.dma.fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &snapshot) < 0)
+            return failOwnership("snapshot-reservation");
+          OwnedFd next { snapshot.fd };
+          if (dependency.fd < 0) {
+            dependency.fd = std::exchange(next.fd, -1);
+          } else {
+            sync_merge_data merge = {};
+            merge.fd2 = next.fd;
+            if (ioctl(dependency.fd, SYNC_IOC_MERGE, &merge) < 0)
+              return failOwnership("merge-reservations");
+            close(dependency.fd);
+            dependency.fd = merge.fence;
+          }
+        }
+
+        if (dependency.fd >= 0) {
+          m_syncFileWait = new DxvkSyncFileSignal(m_device);
+          if (!m_syncFileWait->handle() || m_syncFileWait->importFd(dependency.fd) != VK_SUCCESS)
+            return failOwnership("import-wait-semaphore");
+          dependency.fd = -1;
+        }
+
+        m_syncFileSignal = new DxvkSyncFileSignal(m_device);
+        if (!m_syncFileSignal->handle())
+          return failOwnership("create-release-semaphore");
+        for (auto& publication : publications) {
+          if (pwrite(publication.lock.fd, "X", 1, 0) != 1)
+            return failOwnership("mark-in-flight");
+        }
+        executePublication = true;
+      }
+    }
+#endif
+    const auto handleSubmitFailure = [&] (VkResult result) {
+#ifdef __ANDROID__
+      if (executePublication)
+        return failOwnership("queue-submit", result);
+#endif
+      return result;
+    };
     m_commandSubmission.reset();
 
     for (size_t i = 0; i < m_cmdSubmissions.size(); i++) {
@@ -272,6 +615,10 @@ namespace dxvk {
         : nullptr;
 
       if (isFirst) {
+        if (m_syncFileWait)
+          m_commandSubmission.waitSemaphore(m_syncFileWait->handle(),
+            0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+
         // Wait for per-command list semaphores on first submission
         for (size_t i = 0; i < m_waitSemaphores.size(); i++) {
           m_commandSubmission.waitSemaphore(m_waitSemaphores[i].fence->handle(),
@@ -288,12 +635,16 @@ namespace dxvk {
         sparseBind->signalSemaphore(semaphores.graphics, ++timelines.graphics);
 
         if ((status = sparseBind->submit(m_device, sparse.queueHandle)))
-          return status;
+          return handleSubmitFailure(status);
 
         m_commandSubmission.waitSemaphore(semaphores.graphics,
           timelines.graphics, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
       }
 
+#ifdef __ANDROID__
+      if (executePublication && isFirst && m_syncFileWait)
+        m_commandSubmission.executeCommandBuffer(m_publicationAcquire);
+#endif
       // Execute transfer command buffer, if any
       for (auto cmdBuffer : SdmaCmdBuffers) {
         if (cmd.cmdBuffers[uint32_t(cmdBuffer)])
@@ -307,7 +658,7 @@ namespace dxvk {
           ++timelines.transfer, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 
         if ((status = m_commandSubmission.submit(m_device, transfer.queueHandle, trackedId)))
-          return status;
+          return handleSubmitFailure(status);
 
         m_commandSubmission.waitSemaphore(semaphores.transfer,
           timelines.transfer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
@@ -331,11 +682,19 @@ namespace dxvk {
         m_commandSubmission.executeCommandBuffer(cmd.cmdBuffers[uint32_t(DxvkCmdBuffer::ExecBuffer)]);
 
       if (isLast) {
+#ifdef __ANDROID__
+        if (executePublication)
+          m_commandSubmission.executeCommandBuffer(m_publicationRelease);
+#endif
         // Signal per-command list semaphores on the final submission
         for (size_t i = 0; i < m_signalSemaphores.size(); i++) {
           m_commandSubmission.signalSemaphore(m_signalSemaphores[i].fence->handle(),
             m_signalSemaphores[i].value, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
         }
+
+        if (m_syncFileSignal)
+          m_commandSubmission.signalSemaphore(m_syncFileSignal->handle(),
+            0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
 
         // Signal WSI semaphore on the final submission
         if (m_wsiSemaphores.present) {
@@ -349,7 +708,7 @@ namespace dxvk {
 
       // Finally, submit all graphics commands of the current submission
       if ((status = m_commandSubmission.submit(m_device, graphics.queueHandle, trackedId)))
-        return status;
+        return handleSubmitFailure(status);
 
       // If there are WSI semaphores involved, do another submit only
       // containing a timeline semaphore signal so that we can be sure
@@ -359,7 +718,7 @@ namespace dxvk {
           ++timelines.graphics, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 
         if ((status = m_commandSubmission.submit(m_device, graphics.queueHandle, trackedId)))
-          return status;
+          return handleSubmitFailure(status);
       }
 
       // Finally, submit semaphore wait on the transfer queue. If this
@@ -369,10 +728,36 @@ namespace dxvk {
           timelines.graphics, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
 
         if (isLast && (status = m_commandSubmission.submit(m_device, transfer.queueHandle, trackedId)))
-          return status;
+          return handleSubmitFailure(status);
       }
     }
 
+#ifdef __ANDROID__
+    if (executePublication) {
+      OwnedFd fence;
+      if (m_syncFileSignal->exportFd(&fence.fd) != VK_SUCCESS)
+        return failOwnership("export-signal-semaphore");
+      if (fence.fd >= 0) {
+        static const bool inject = env::getEnvVar("NPT_DMABUF_TEST_FAIL_PUBLICATION") == "1";
+        dma_buf_import_sync_file publish { DMA_BUF_SYNC_WRITE, inject ? -1 : fence.fd };
+        for (auto& publication : publications) {
+          if (ioctl(publication.dma.fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &publish) < 0)
+            return failOwnership("publish-reservation");
+        }
+      }
+      for (auto& publication : publications) {
+        if (pwrite(publication.lock.fd, "E", 1, 0) != 1)
+          return failOwnership("mark-external");
+      }
+      static thread_local unsigned verified = 0;
+      if (verified++ < 24) {
+        for (const auto* entry : ownedImages)
+          Logger::warn(str::format("NPT-DMABUF-OWNERSHIP-SUBMITTED pid=", getpid(),
+            " inode=", entry->image->dmabufPublicationInode(), " write=", entry->write,
+            " acquire=", bool(m_syncFileWait), " images=", ownedImages.size()));
+      }
+    }
+#endif
     return VK_SUCCESS;
   }
   
@@ -411,6 +796,10 @@ namespace dxvk {
 
     // Reset all command buffer handles
     m_cmd = DxvkCommandSubmissionInfo();
+
+#ifdef __ANDROID__
+    recordPublicationOwnership();
+#endif
 
     // Increment queue submission count
     uint64_t submissionCount = m_cmdSubmissions.size();
@@ -476,6 +865,13 @@ namespace dxvk {
 
     m_waitSemaphores.clear();
     m_signalSemaphores.clear();
+    m_syncFileSignal = nullptr;
+    m_syncFileWait = nullptr;
+#ifdef __ANDROID__
+    m_publicationImages.clear();
+    m_publicationAcquire = VK_NULL_HANDLE;
+    m_publicationRelease = VK_NULL_HANDLE;
+#endif
 
     m_cmdSubmissions.clear();
     m_cmdSparseBinds.clear();

@@ -1284,6 +1284,14 @@ namespace dxvk {
      */
     void signalFence(const Rc<DxvkFence>& fence, uint64_t value);
 
+    void waitSyncFile(const Rc<DxvkSyncFileSignal>& wait) {
+      m_cmd->waitSyncFile(wait);
+    }
+
+    void signalSyncFile(const Rc<DxvkSyncFileSignal>& signal) {
+      m_cmd->signalSyncFile(signal);
+    }
+
     /**
      * \brief Begins a debug label region
      *
@@ -2252,6 +2260,15 @@ namespace dxvk {
 
     template<bool AlwaysTrack, bool IsWritable>
     force_inline void trackImageViewBinding(const DxvkShaderDescriptor& binding, DxvkImageView& view) {
+#ifdef __ANDROID__
+      // Sampling a shared image already in GENERAL may not transition its
+      // layout. Capture it before recording the first descriptor access.
+      if (unlikely(view.image()->dmabufPublicationInode())) {
+        auto& image = *view.image();
+        m_cmd->capturePublicationImageLayout(&image,
+          image.queryLayout(image.getAvailableSubresources()), false);
+      }
+#endif
       DxvkAccessOp accessOp = IsWritable ? binding.getAccessOp() : DxvkAccessOp::None;
 
       if (AlwaysTrack || unlikely(view.hasGfxStores())) {

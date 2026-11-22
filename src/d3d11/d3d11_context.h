@@ -869,12 +869,24 @@ namespace dxvk {
     void NptUpdateOmShared();
     void NptDrawSyncNow();
     void NptTouch(ID3D11Resource* pRes);
-    bool NptTinySync(ID3D11Resource* pRes);
+    bool NptTinySync(ID3D11Resource* pRes, bool producer = false);
     void NptReadSyncBeforeDraw();
+    bool NptBeginWriteBeforeDraw();
+    void NptEndWriteAfterDraw();
     struct NptDrawSyncGuard {
       D3D11CommonContext* c;
-      explicit NptDrawSyncGuard(D3D11CommonContext* ctx, bool readSync = false) : c(ctx) { if (readSync) c->NptReadSyncBeforeDraw(); }
-      ~NptDrawSyncGuard() { c->NptDrawSyncNow(); }
+      bool publishWrite = false;
+      explicit NptDrawSyncGuard(D3D11CommonContext* ctx, bool readSync = false) : c(ctx) {
+        if (readSync) {
+          c->NptReadSyncBeforeDraw();
+          publishWrite = c->NptBeginWriteBeforeDraw();
+        }
+      }
+      ~NptDrawSyncGuard() {
+        if (publishWrite)
+          c->NptEndWriteAfterDraw();
+        c->NptDrawSyncNow();
+      }
     };
     std::vector<Com<ID3D11Resource>> m_nptTouched;
     std::map<uint32_t, Com<ID3D11Texture2D>> m_nptTinyStage;

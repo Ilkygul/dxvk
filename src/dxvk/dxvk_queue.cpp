@@ -192,6 +192,13 @@ namespace dxvk {
       if (entry.status)
         entry.status->result = entry.result;
       
+      // Device loss bypasses the finish queue, so signal CPU-side
+      // completion callbacks and release resource waiters here too.
+      if (entry.result == VK_ERROR_DEVICE_LOST && entry.submit.cmdList != nullptr) {
+        m_lastError = entry.result;
+        entry.submit.cmdList->notifyObjects();
+      }
+
       // On success, pass it on to the queue thread
       { std::unique_lock<dxvk::mutex> lock(m_mutex);
 
@@ -206,6 +213,8 @@ namespace dxvk {
 
           if (m_lastError != VK_ERROR_DEVICE_LOST)
             m_device->waitForIdle();
+          else
+            m_finishCond.notify_all();
         }
 
         m_submitQueue.pop();

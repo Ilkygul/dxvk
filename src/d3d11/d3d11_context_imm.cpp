@@ -1,3 +1,13 @@
+#ifdef __ANDROID__
+#include <fcntl.h>
+#include <linux/dma-buf.h>
+#include <poll.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #if defined(__ANDROID__)
 #include <android/log.h>
 #endif
@@ -90,6 +100,10 @@ namespace dxvk {
     if (DataSize && DataSize != pAsync->GetDataSize())
       return E_INVALIDARG;
     
+    const HRESULT removed = m_parent->GetDeviceRemovedReason();
+    if (FAILED(removed))
+      return removed;
+
     // Passing a non-null pData is actually allowed if
     // DataSize is 0, but we should ignore that pointer
     pData = DataSize ? pData : nullptr;
@@ -324,17 +338,26 @@ namespace dxvk {
     if (unlikely(!pResource))
       return E_INVALIDARG;
     
+    HRESULT removed = m_parent->GetDeviceRemovedReason();
+    if (FAILED(removed))
+      return removed;
+
     D3D11_RESOURCE_DIMENSION resourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     pResource->GetType(&resourceDim);
+    const HRESULT mapped = resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER
+      ? MapBuffer(static_cast<D3D11Buffer*>(pResource), MapType, MapFlags, pMappedResource)
+      : MapImage(GetCommonTexture(pResource), Subresource, MapType, MapFlags, pMappedResource);
 
-    if (likely(resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER)) {
-      return MapBuffer(
-        static_cast<D3D11Buffer*>(pResource),
-        MapType, MapFlags, pMappedResource);
-    } else {
-      return MapImage(GetCommonTexture(pResource),
-        Subresource, MapType, MapFlags, pMappedResource);
+    removed = m_parent->GetDeviceRemovedReason();
+    if (FAILED(removed)) {
+      if (SUCCEEDED(mapped) && pMappedResource)
+        Unmap(pResource, Subresource);
+      if (pMappedResource)
+        *pMappedResource = {};
+      return removed;
     }
+
+    return mapped;
   }
   
   
@@ -903,6 +926,209 @@ namespace dxvk {
   }
 
 
+  VkResult D3D11ImmediateContext::NptWaitForAtlasPublication() {
+    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, false, nullptr, true);
+    return m_submitStatus.result;
+  }
+
+
+  bool D3D11ImmediateContext::NptPublishTinyCopy(
+          ID3D11Resource* staging, ID3D11Resource* source, const D3D11_BOX* box, bool producer) {
+#ifdef __ANDROID__
+    auto rejected = [](const char* stage, int status) {
+      Logger::warn(str::format("NPT-DMABUF-PUBLICATION stage=", stage,
+        " pid=", getpid(), " status=", status));
+      return false;
+    };
+    D3D10DeviceLock contextLock = LockContext();
+    auto* texture = GetCommonTexture(source);
+    const int companion = texture->dmabufPublicationFd();
+    if (companion < 0)
+      return rejected("companion", companion);
+
+    struct ScopedFd {
+      int fd;
+      ~ScopedFd() { if (fd >= 0) close(fd); }
+    };
+    struct stat identity;
+    if (fstat(companion, &identity) < 0)
+      return rejected("slot-identity", errno);
+    // Sample the first few distinct slots per role. Leave every legacy wait in place.
+    static thread_local std::array<ino_t, 8> seen[2] = {};
+    auto& sampled = seen[producer];
+    if (std::find(sampled.begin(), sampled.end(), identity.st_ino) != sampled.end())
+      return false;
+    auto free = std::find(sampled.begin(), sampled.end(), ino_t(0));
+    if (free == sampled.end())
+      return false;
+    *free = identity.st_ino;
+
+    const auto lockPath = str::format("/proc/self/fd/", companion);
+    ScopedFd lock { open(lockPath.c_str(), O_RDWR | O_CLOEXEC) };
+    if (lock.fd < 0)
+      return rejected("open-lock", errno);
+    if (flock(lock.fd, LOCK_EX | LOCK_NB) < 0)
+      return rejected("flock", errno);
+
+    char state = 0;
+    if (pread(lock.fd, &state, 1, 0) != 1 || (state != 'C' && state != 'R'))
+      return rejected("state", state);
+
+    ScopedFd dma { -1 };
+    const VkResult dupStatus = texture->GetImage()->dupDmabufFd(&dma.fd);
+    if (dupStatus != VK_SUCCESS)
+      return rejected("dup-dma", int(dupStatus));
+
+    const Rc<DxvkSyncFileSignal> release = new DxvkSyncFileSignal(m_device.ptr());
+    if (!release->handle())
+      return rejected("release-semaphore", 0);
+
+    Rc<DxvkSyncFileSignal> acquire;
+    if (!producer) {
+      acquire = new DxvkSyncFileSignal(m_device.ptr());
+      if (!acquire->handle())
+        return rejected("acquire-semaphore", 0);
+      dma_buf_export_sync_file snapshot { DMA_BUF_SYNC_READ, -1 };
+      if (ioctl(dma.fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &snapshot) < 0)
+        return rejected("snapshot", errno);
+      ScopedFd dependency { snapshot.fd };
+      const VkResult imported = acquire->importFd(dependency.fd);
+      if (imported != VK_SUCCESS)
+        return rejected("import-fence", int(imported));
+      dependency.fd = -1; // Vulkan owns a successfully imported FD.
+    }
+
+    if (pwrite(lock.fd, "D", 1, 0) != 1)
+      return rejected("set-dirty", errno);
+
+    if (acquire)
+      EmitCs<false>([acquire] (DxvkContext* ctx) { ctx->waitSyncFile(acquire); });
+    // On the producer the actual write was already recorded. This trace only
+    // publishes its queue completion, and leaves the original write wait intact.
+    CopySubresourceRegion(staging, 0, 0, 0, 0, source, 0, box);
+    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, false, release);
+    const VkResult submitted = m_device->waitForSubmission(&m_submitStatus);
+    ScopedFd fence { -1 };
+    const VkResult exported = submitted == VK_SUCCESS ? release->exportFd(&fence.fd) : submitted;
+    int published = -1;
+    if (exported == VK_SUCCESS && fence.fd >= 0) {
+      dma_buf_import_sync_file publish { uint32_t(producer ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ), fence.fd };
+      published = ioctl(dma.fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &publish);
+    }
+    if (published == 0)
+      published = pwrite(lock.fd, producer ? "C" : "R", 1, 0) == 1 ? 0 : -1;
+
+    Logger::warn(str::format("NPT-DMABUF-PUBLICATION-FENCE pid=", getpid(),
+      " role=", producer ? "write" : "read", " inode=", uint64_t(identity.st_ino),
+      " fs=", uint64_t(identity.st_dev), " width=", texture->Desc()->Width,
+      " height=", texture->Desc()->Height, " submit=", int(submitted),
+      " export=", int(exported), " real_fd=", fence.fd >= 0, " publish=", published));
+    return true; // The copy was recorded. Caller still performs the legacy Map wait.
+#else
+    return false;
+#endif
+  }
+
+
+#ifdef __ANDROID__
+  bool D3D11ImmediateContext::NptAcquireWrite(D3D11CommonTexture* texture) {
+    if (m_nptWriteLock >= 0)
+      return false;
+
+    struct stat identity;
+    const int companion = texture->dmabufPublicationFd();
+    if (fstat(companion, &identity) < 0)
+      return false;
+
+    struct Sample { ino_t inode = 0; unsigned submitted = 0; };
+    static thread_local std::array<Sample, 8> seen = {};
+    auto slot = std::find_if(seen.begin(), seen.end(), [&](const Sample& sample) {
+      return sample.inode == identity.st_ino;
+    });
+    if (slot == seen.end())
+      slot = std::find_if(seen.begin(), seen.end(), [](const Sample& sample) { return sample.inode == 0; });
+    if (slot == seen.end() || slot->submitted >= 2)
+      return false;
+
+    struct LocalFd {
+      int fd;
+      ~LocalFd() { if (fd >= 0) close(fd); }
+      int release() { return std::exchange(fd, -1); }
+    };
+    const auto path = str::format("/proc/self/fd/", companion);
+    LocalFd lock { open(path.c_str(), O_RDWR | O_CLOEXEC) };
+    if (lock.fd < 0 || flock(lock.fd, LOCK_EX | LOCK_NB) < 0)
+      return false;
+
+    char state = 0;
+    if (pread(lock.fd, &state, 1, 0) != 1 || (state != 'C' && state != 'R'))
+      return false;
+
+    if (slot->submitted && state != 'R')
+      return false;
+
+    LocalFd dma { -1 };
+    if (texture->GetImage()->dupDmabufFd(&dma.fd) != VK_SUCCESS)
+      return false;
+    const Rc<DxvkSyncFileSignal> acquire = new DxvkSyncFileSignal(m_device.ptr());
+    Rc<DxvkSyncFileSignal> release = new DxvkSyncFileSignal(m_device.ptr());
+    if (!acquire->handle() || !release->handle())
+      return false;
+
+    dma_buf_export_sync_file snapshot { DMA_BUF_SYNC_WRITE, -1 };
+    if (ioctl(dma.fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &snapshot) < 0)
+      return false;
+    LocalFd dependency { snapshot.fd };
+    pollfd pending { dependency.fd, POLLIN, 0 };
+    const int ready = poll(&pending, 1, 0);
+    if (ready < 0 || (pending.revents & (POLLERR | POLLHUP | POLLNVAL)))
+      return false;
+    if (acquire->importFd(dependency.fd) != VK_SUCCESS)
+      return false;
+    dependency.release(); // Vulkan owns a successfully imported FD.
+    if (pwrite(lock.fd, "D", 1, 0) != 1)
+      return false;
+
+    m_nptWriteLock = lock.release();
+    m_nptWriteDma = dma.release();
+    m_nptWriteInode = identity.st_ino;
+    m_nptWriteReturnsFromRead = state == 'R';
+    m_nptWriteDependencyReady = ready;
+    slot->inode = identity.st_ino;
+    slot->submitted++;
+    m_nptWriteRelease = std::move(release);
+    EmitCs<false>([acquire] (DxvkContext* ctx) { ctx->waitSyncFile(acquire); });
+    return true;
+  }
+
+
+  void D3D11ImmediateContext::NptReleaseWrite() {
+    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, false, m_nptWriteRelease);
+    const VkResult submitted = m_device->waitForSubmission(&m_submitStatus);
+    int fd = -1;
+    const VkResult exported = submitted == VK_SUCCESS ? m_nptWriteRelease->exportFd(&fd) : submitted;
+    int published = -1;
+    if (exported == VK_SUCCESS && fd >= 0) {
+      dma_buf_import_sync_file publish { DMA_BUF_SYNC_WRITE, fd };
+      published = ioctl(m_nptWriteDma, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &publish);
+    }
+    if (published == 0 && pwrite(m_nptWriteLock, "C", 1, 0) != 1)
+      published = -1;
+
+    Logger::warn(str::format("NPT-DMABUF-PUBLICATION-PREWRITE pid=", getpid(),
+      " inode=", m_nptWriteInode, " after_read=", m_nptWriteReturnsFromRead,
+      " dependency_ready=", m_nptWriteDependencyReady, " submit=", int(submitted),
+      " export=", int(exported), " real_fd=", fd >= 0, " publish=", published));
+
+    if (fd >= 0)
+      close(fd);
+    close(std::exchange(m_nptWriteDma, -1));
+    close(std::exchange(m_nptWriteLock, -1));
+    m_nptWriteRelease = nullptr;
+  }
+#endif
+
+
   void D3D11ImmediateContext::SynchronizeDevice() {
     m_device->waitForIdle();
   }
@@ -1134,14 +1360,17 @@ namespace dxvk {
   void D3D11ImmediateContext::ExecuteFlush(
           GpuFlushType                FlushType,
           HANDLE                      hEvent,
-          BOOL                        Synchronize) {
-    bool synchronizeSubmission = Synchronize && m_parent->Is11on12Device();
+          BOOL                        Synchronize,
+    const Rc<DxvkSyncFileSignal>&       SyncFileSignal,
+          bool                        WaitForPublication) {
+    const bool synchronizeSubmission = WaitForPublication || SyncFileSignal ||
+      (Synchronize && m_parent->Is11on12Device());
 
     if (synchronizeSubmission)
       m_submitStatus.result = VK_NOT_READY;
 
     // Exit early if there's nothing to do
-    if (!GetPendingCsChunks() && !hEvent)
+    if (!GetPendingCsChunks() && !hEvent && !SyncFileSignal && !WaitForPublication)
       return;
 
     m_hasPendingUnresolvedPass = false;
@@ -1162,6 +1391,7 @@ namespace dxvk {
       cSubmissionFence  = m_submissionFence,
       cSubmissionId     = submissionId,
       cSubmissionStatus = synchronizeSubmission ? &m_submitStatus : nullptr,
+      cSyncFileSignal    = SyncFileSignal,
       cStagingFence     = m_stagingBufferFence,
       cStagingMemory    = GetStagingMemoryStatistics().allocatedTotal,
       cFlushReason      = std::exchange(m_flushReason, std::string())
@@ -1170,6 +1400,8 @@ namespace dxvk {
 
       ctx->signal(cSubmissionFence, cSubmissionId);
       ctx->signal(cStagingFence, cStagingMemory);
+      if (cSyncFileSignal)
+        ctx->signalSyncFile(cSyncFileSignal);
       ctx->flushCommandList(&debugLabel, cSubmissionStatus);
     });
 

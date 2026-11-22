@@ -7,6 +7,54 @@
 
 namespace dxvk {
 
+  DxvkSyncFileSignal::DxvkSyncFileSignal(DxvkDevice* device)
+  : m_vkd(device->vkd()) {
+#ifndef _WIN32
+    if (!m_vkd->vkGetSemaphoreFdKHR)
+      return;
+
+    VkExportSemaphoreCreateInfo exportInfo = { VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
+    exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+    VkSemaphoreCreateInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    info.pNext = &exportInfo;
+    if (m_vkd->vkCreateSemaphore(m_vkd->device(), &info, nullptr, &m_semaphore) != VK_SUCCESS)
+      m_semaphore = VK_NULL_HANDLE;
+#endif
+  }
+
+  DxvkSyncFileSignal::~DxvkSyncFileSignal() {
+    if (m_semaphore)
+      m_vkd->vkDestroySemaphore(m_vkd->device(), m_semaphore, nullptr);
+  }
+
+  VkResult DxvkSyncFileSignal::importFd(int fd) const {
+#ifndef _WIN32
+    if (m_semaphore && m_vkd->vkImportSemaphoreFdKHR) {
+      VkImportSemaphoreFdInfoKHR info = { VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR };
+      info.semaphore = m_semaphore;
+      info.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+      info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+      info.fd = fd;
+      return m_vkd->vkImportSemaphoreFdKHR(m_vkd->device(), &info);
+    }
+#endif
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+
+  VkResult DxvkSyncFileSignal::exportFd(int* fd) const {
+    *fd = -1;
+#ifndef _WIN32
+    if (m_semaphore) {
+      VkSemaphoreGetFdInfoKHR info = { VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR };
+      info.semaphore = m_semaphore;
+      info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+      return m_vkd->vkGetSemaphoreFdKHR(m_vkd->device(), &info, fd);
+    }
+#endif
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+
+
   DxvkFence::DxvkFence(
           DxvkDevice*           device,
     const DxvkFenceCreateInfo&  info)

@@ -15,6 +15,20 @@ namespace dxvk {
   class DxvkDevice;
   class DxvkFence;
 
+  class DxvkSyncFileSignal final : public RcObject {
+  public:
+    explicit DxvkSyncFileSignal(DxvkDevice* device);
+    ~DxvkSyncFileSignal();
+
+    VkSemaphore handle() const { return m_semaphore; }
+    VkResult exportFd(int* fd) const;
+    VkResult importFd(int fd) const;
+
+  private:
+    Rc<vk::DeviceFn> m_vkd;
+    VkSemaphore m_semaphore = VK_NULL_HANDLE;
+  };
+
   using DxvkFenceEvent = std::function<void ()>;
 
   /**

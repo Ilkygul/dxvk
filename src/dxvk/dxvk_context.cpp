@@ -976,6 +976,9 @@ namespace dxvk {
   void DxvkContext::initImage(
     const Rc<DxvkImage>&            image,
           VkImageLayout             initialLayout) {
+#ifdef __ANDROID__
+    m_cmd->capturePublicationImageLayout(image.ptr(), initialLayout, true);
+#endif
     VkImageSubresourceRange subresources = image->getAvailableSubresources();
 
     if (initialLayout == VK_IMAGE_LAYOUT_PREINITIALIZED) {
@@ -9367,6 +9370,12 @@ namespace dxvk {
           DxvkImage&                image,
     const VkImageSubresourceRange&  subresources,
           bool                      keepAttachments) {
+    // Record the layout before tracking creates the publication entry.
+#ifdef __ANDROID__
+    if (image.dmabufPublicationInode())
+      m_cmd->capturePublicationImageLayout(&image,
+        image.queryLayout(image.getAvailableSubresources()), false);
+#endif
     // Note that this method does not flush layout transitions
     m_cmd->track(&image, DxvkAccess::Read);
 
@@ -9503,6 +9512,11 @@ namespace dxvk {
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess,
           bool                      discard) {
+#ifdef __ANDROID__
+    if (image.dmabufPublicationInode())
+      m_cmd->capturePublicationImageLayout(&image,
+        image.queryLayout(image.getAvailableSubresources()), false);
+#endif
     // If all subresources are in the correct layout, we don't need to do anything.
     // If we're discarding a render target, re-initialize the image since doing so
     // may lead to more efficient compression in some cases.
@@ -9786,6 +9800,12 @@ namespace dxvk {
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess,
           DxvkAccessOp              accessOp) {
+#ifdef __ANDROID__
+    // Some accesses use an in-place barrier and never call transitionImageLayout.
+    if (image.dmabufPublicationInode())
+      m_cmd->capturePublicationImageLayout(&image,
+        image.queryLayout(image.getAvailableSubresources()), false);
+#endif
     auto& batch = getBarrierBatch(cmdBuffer);
 
     VkImageMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };

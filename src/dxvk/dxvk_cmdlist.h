@@ -349,18 +349,36 @@ namespace dxvk {
      */
     template<typename T>
     void track(Rc<T>&& object, DxvkAccess access) {
+#ifdef __ANDROID__
+      if constexpr (std::is_same_v<T, DxvkImage>) {
+        if (object.ptr()->dmabufPublicationInode())
+          trackPublicationImage(object.ptr(), access);
+      }
+#endif
       if (object->trackId(m_trackingId, access))
         m_objectTracker.track<DxvkResourceRef>(std::move(object), access);
     }
 
     template<typename T>
     void track(const Rc<T>& object, DxvkAccess access) {
+#ifdef __ANDROID__
+      if constexpr (std::is_same_v<T, DxvkImage>) {
+        if (object.ptr()->dmabufPublicationInode())
+          trackPublicationImage(object.ptr(), access);
+      }
+#endif
       if (object->trackId(m_trackingId, access))
         m_objectTracker.track<DxvkResourceRef>(object.ptr(), access);
     }
 
     template<typename T>
     void track(T* object, DxvkAccess access) {
+#ifdef __ANDROID__
+      if constexpr (std::is_same_v<T, DxvkImage>) {
+        if (object->dmabufPublicationInode())
+          trackPublicationImage(object, access);
+      }
+#endif
       if (object->trackId(m_trackingId, access))
         m_objectTracker.track<DxvkResourceRef>(object, access);
     }
@@ -410,6 +428,19 @@ namespace dxvk {
      * \param [in] fence Fence to signal
      * \param [in] value Value to signal to
      */
+#ifdef __ANDROID__
+    void trackPublicationImage(DxvkImage* image, DxvkAccess access);
+    void capturePublicationImageLayout(DxvkImage* image, VkImageLayout layout, bool localInitialization);
+#endif
+
+    void waitSyncFile(const Rc<DxvkSyncFileSignal>& wait) {
+      m_syncFileWait = wait;
+    }
+
+    void signalSyncFile(const Rc<DxvkSyncFileSignal>& signal) {
+      m_syncFileSignal = signal;
+    }
+
     void signalFence(Rc<DxvkFence> fence, uint64_t value) {
       m_signalSemaphores.emplace_back(std::move(fence), value);
     }
@@ -1277,6 +1308,23 @@ namespace dxvk {
 
     small_vector<DxvkFenceValuePair, 4> m_waitSemaphores;
     small_vector<DxvkFenceValuePair, 4> m_signalSemaphores;
+    Rc<DxvkSyncFileSignal> m_syncFileSignal;
+    Rc<DxvkSyncFileSignal> m_syncFileWait;
+
+#ifdef __ANDROID__
+    struct PublicationImage {
+      Rc<DxvkImage> image;
+      bool read = false;
+      bool write = false;
+      VkImageLayout startLayout = VK_IMAGE_LAYOUT_MAX_ENUM;
+      bool localInitialization = false;
+    };
+    small_vector<PublicationImage, 4> m_publicationImages;
+    VkCommandBuffer m_publicationAcquire = VK_NULL_HANDLE;
+    VkCommandBuffer m_publicationRelease = VK_NULL_HANDLE;
+
+    void recordPublicationOwnership();
+#endif
 
     small_vector<DxvkCommandSubmissionInfo, 4> m_cmdSubmissions;
     small_vector<DxvkSparseBindSubmission, 4>  m_cmdSparseBinds;

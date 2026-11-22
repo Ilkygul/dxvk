@@ -541,7 +541,7 @@ namespace dxvk {
   // Reads one texel (or 4 bytes of a buffer) of the resource back through the immediate context: the copy resolves
   // deferred clears, adds the transfer barriers and the Map waits for the GPU -- exactly what the NPT_DUMP_A8 readback did.
   template<typename ContextType>
-  bool D3D11CommonContext<ContextType>::NptTinySync(ID3D11Resource* pRes) {
+  bool D3D11CommonContext<ContextType>::NptTinySync(ID3D11Resource* pRes, bool producer) {
     if constexpr (IsDeferred) {
       return false;
     } else {
@@ -561,6 +561,45 @@ namespace dxvk {
       } else if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
         auto* t = GetCommonTexture(pRes); if (!t) return false;
         const D3D11_COMMON_TEXTURE_DESC* d = t->Desc();
+#ifdef __ANDROID__
+        static const bool gpuConsumer = env::getEnvVar("NPT_DMABUF_ATLAS_GPU_CONSUMER") == "1";
+        static const bool gpuProducer = env::getEnvVar("NPT_DMABUF_ATLAS_GPU_PRODUCER") == "1";
+        static const bool executeOwnership = env::getEnvVar("NPT_DMABUF_EXECUTE_OWNERSHIP") == "1";
+        const auto sharing = t->GetImage()->info().sharing.mode;
+        const bool gpuAtlas = producer ? gpuProducer && sharing == DxvkSharedHandleMode::Export
+                                       : gpuConsumer && sharing == DxvkSharedHandleMode::Import;
+        static const bool gpuVideo = env::getEnvVar("NPT_DMABUF_VIDEO_HANDOFF") == "1";
+        const auto format = t->GetImage()->info().format;
+        const bool atlas = gpuAtlas && format == VK_FORMAT_R8_UNORM &&
+          d->Width == 1248 && d->Height == 1344;
+        const bool video = gpuVideo && format == VK_FORMAT_B8G8R8A8_UNORM &&
+          d->Width == 1856 && d->Height == 1728 &&
+          sharing == (producer ? DxvkSharedHandleMode::Export : DxvkSharedHandleMode::Import);
+        if (executeOwnership && (atlas || video) && t->dmabufPublicationFd() >= 0) {
+          char phase = 0;
+          if (pread(t->dmabufPublicationFd(), &phase, 1, 0) == 1 &&
+              (phase == 'L' || phase == 'E' || phase == 'X')) {
+            if (producer) {
+              // Returning from the submission thread ensures the reservation
+              // already contains the new fence when the guest signals handoff.
+              const VkResult status = static_cast<ContextType*>(this)->NptWaitForAtlasPublication();
+              static thread_local unsigned loggedPublishes = 0;
+              if (status != VK_SUCCESS || loggedPublishes++ < 4)
+                Logger::warn(str::format("NPT-ATLAS-GPU-PRODUCER pid=", getpid(),
+                  " inode=", t->GetImage()->dmabufPublicationInode(), " video=", video, " result=", int(status)));
+              // Resubmitting a staging copy after a queue error cannot restore
+              // a failed handoff. Queue status already invalidates the device.
+              return true;
+            }
+            // The graphics list acquires the atlas before the shader reads it.
+            static thread_local unsigned logged = 0;
+            if (logged++ < 4)
+              Logger::warn(str::format("NPT-ATLAS-GPU-CONSUMER pid=", getpid(),
+                " inode=", t->GetImage()->dmabufPublicationInode(), " video=", video));
+            return true;
+          }
+        }
+#endif
         if (d->SampleDesc.Count > 1) return false;
         const DXGI_FORMAT f = d->Format;
         if ((f >= DXGI_FORMAT_BC1_TYPELESS && f <= DXGI_FORMAT_BC5_SNORM) || (f >= DXGI_FORMAT_BC6H_TYPELESS && f <= DXGI_FORMAT_BC7_UNORM_SRGB)) return false;
@@ -573,10 +612,63 @@ namespace dxvk {
         }
         stage = it->second.ptr();
       } else return false;
-      ic->CopySubresourceRegion(stage, 0, 0, 0, 0, pRes, 0, &box);
+      bool copyIssued = false;
+#ifdef __ANDROID__
+      static const bool tracePublication = env::getEnvVar("NPT_DMABUF_TRACE_PUBLICATION") == "1";
+      if (tracePublication && !producer && dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        const auto* texture = GetCommonTexture(pRes);
+        const auto mode = texture->GetImage()->info().sharing.mode;
+        const auto* desc = texture->Desc();
+        if (texture->dmabufPublicationFd() >= 0 &&
+            desc->Format == DXGI_FORMAT_B8G8R8A8_UNORM &&
+            desc->Width >= 1600 && desc->Height >= 1000 &&
+            mode == (producer ? DxvkSharedHandleMode::Export : DxvkSharedHandleMode::Import))
+          copyIssued = static_cast<ContextType*>(this)->NptPublishTinyCopy(stage, pRes, &box, producer);
+      }
+#endif
+#ifdef __ANDROID__
+      static const bool profileAtlas = env::getEnvVar("NPT_SETTINGS_ATLAS_WAIT") == "1";
+      const auto* texture = profileAtlas && dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D
+        ? GetCommonTexture(pRes) : nullptr;
+      const bool sampleAtlas = texture &&
+        texture->GetImage()->info().format == VK_FORMAT_R8_UNORM &&
+        texture->Desc()->Width == 1248 && texture->Desc()->Height == 1344;
+      using Clock = std::chrono::steady_clock;
+      const auto before = sampleAtlas ? Clock::now() : Clock::time_point{};
+#endif
+      if (!copyIssued)
+        ic->CopySubresourceRegion(stage, 0, 0, 0, 0, pRes, 0, &box);
+#ifdef __ANDROID__
+      const auto afterCopy = sampleAtlas ? Clock::now() : Clock::time_point{};
+#endif
       D3D11_MAPPED_SUBRESOURCE m;
       if (FAILED(ic->Map(stage, 0, D3D11_MAP_READ, 0, &m))) return false;
       ic->Unmap(stage, 0);
+#ifdef __ANDROID__
+      if (sampleAtlas) {
+        struct Timing {
+          uint64_t count = 0, copyNs = 0, mapNs = 0, maxMapNs = 0;
+        };
+        static thread_local Timing timings[2];
+        auto& timing = timings[producer];
+        const auto afterMap = Clock::now();
+        const uint64_t mapNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          afterMap - afterCopy).count();
+        timing.copyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          afterCopy - before).count();
+        timing.mapNs += mapNs;
+        timing.maxMapNs = std::max(timing.maxMapNs, mapNs);
+        if (++timing.count == 32) {
+          Logger::warn(str::format("NPT-SETTINGS-ATLAS-WAIT pid=", getpid(),
+            " t_ns=", afterMap.time_since_epoch().count(), " producer=", producer,
+            " inode=", texture->GetImage()->dmabufPublicationInode(),
+            " sharing=", int(texture->GetImage()->info().sharing.mode),
+            " n=", timing.count, " copy_ns=", timing.copyNs, " map_ns=", timing.mapNs,
+            " max_map_ns=", timing.maxMapNs));
+          timing = {};
+        }
+      }
+#endif
       return true;
     }
   }
@@ -631,6 +723,54 @@ namespace dxvk {
   }
 
   template<typename ContextType>
+  bool D3D11CommonContext<ContextType>::NptBeginWriteBeforeDraw() {
+#ifdef __ANDROID__
+    if constexpr (!IsDeferred) {
+      static const bool enabled = env::getEnvVar("NPT_DMABUF_TRACE_PREWRITE") == "1";
+      if (!enabled || !m_nptOmShared || m_state.om.minUav < m_state.om.maxUav)
+        return false;
+
+      ID3D11RenderTargetView* target = nullptr;
+      for (const auto& view : m_state.om.rtvs) {
+        if (view == nullptr)
+          continue;
+        if (target)
+          return false;
+        target = view.ptr();
+      }
+      if (!target)
+        return false;
+
+      auto* renderTarget = static_cast<D3D11RenderTargetView*>(target);
+      if (!NptViewShared(renderTarget->GetImageView()))
+        return false;
+
+      Com<ID3D11Resource> resource;
+      target->GetResource(&resource);
+      auto* texture = GetCommonTexture(resource.ptr());
+      if (!texture || texture->dmabufPublicationFd() < 0)
+        return false;
+
+      const auto* desc = texture->Desc();
+      if (desc->Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc->Width < 1600 || desc->Height < 1000 ||
+          texture->GetImage()->info().sharing.mode != DxvkSharedHandleMode::Export)
+        return false;
+
+      return static_cast<ContextType*>(this)->NptAcquireWrite(texture);
+    }
+#endif
+    return false;
+  }
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::NptEndWriteAfterDraw() {
+#ifdef __ANDROID__
+    if constexpr (!IsDeferred)
+      static_cast<ContextType*>(this)->NptReleaseWrite();
+#endif
+  }
+
+  template<typename ContextType>
   void D3D11CommonContext<ContextType>::NptDrawSyncNow() {
     if constexpr (!IsDeferred) {
       if (m_nptSharedDirty && nptSharedDrawSyncEnabled() && nptSharedSyncEnabled()) {
@@ -649,7 +789,7 @@ namespace dxvk {
                 Com<ID3D11Resource> r; m_state.om.uavs[i]->GetResource(&r); if (r != nullptr) touched.push_back(std::move(r)); }
           }
           for (auto& r : touched) {
-            const bool tinyDone = NptTinySync(r.ptr());
+            const bool tinyDone = NptTinySync(r.ptr(), true);
             done |= tinyDone;
             nptTraceSharedGuard("destination-write-after-op", this, m_device.ptr(), r.ptr(), tinyDone);
           }
